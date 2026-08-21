@@ -1,10 +1,20 @@
 # AI Context — dip_Distributed_LLM_Runtime
 
-このドキュメントは、このリポジトリをAIエージェントや新しい開発者が短時間で把握するためのコンテキストです。
+このドキュメントは、このリポジトリをAIエージェントや新しい開発者が短時間で把握するための入口です。
 
 設計仕様を固定することが目的ではありません。実装・調査・実測によって前提が変わった場合は、この文書も更新していく想定です。
 
-開発時の共通ルールや進め方は `AGENTS.md` を参照してください。このファイルでは、主に現在のプロジェクト状況・仮説・未確定事項を扱います。
+開発時の共通ルールや進め方は `AGENTS.md` を参照してください。
+
+## ドキュメント構成
+
+| 文書 | 内容 |
+|---|---|
+| [DECISIONS.md](DECISIONS.md) | チームで確定した決定事項。製品判断と技術的事実を区別して記録 |
+| [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) | Runtime が Web アプリ側に提供する境界と API。**P0 未解決あり** |
+| [CONSTRAINTS.md](CONSTRAINTS.md) | 技術制約を「検証済み / 仮説 / 未解決」で分類 |
+| [EXPERIMENTS.md](EXPERIMENTS.md) | モデルサイズの梯子と実験計画 |
+| [handoff/web-repo-corrections.md](handoff/web-repo-corrections.md) | Web アプリ側リポジトリへの指摘 |
 
 ## このリポジトリについて
 
@@ -12,31 +22,18 @@
 
 Webアプリ本体（React / Hono / UI / Room管理など）は、別リポジトリ `RiTa-23/dip_Distributed_LLM` で開発しています。
 
-このリポジトリでは主にRuntimeとそのbuild artifactを作り、Webアプリ側から利用する形を想定しています。Runtimeを独立して利用しやすい形にできるとよさそうですが、npm packageなどの具体的な配布形式はまだ決めていません。
+このリポジトリでは主にRuntimeとそのbuild artifactを作り、Webアプリ側から利用する形を想定しています。npm packageなどの具体的な配布形式はまだ決めていません。
 
 ## 現在目指している体験
-
-現時点では、次のような体験を目指しています。
 
 - ユーザーがブラウザから参加できる
 - 複数PCの計算資源を利用する
 - 1台では扱いにくい、より大きなLLMを複数PCで動かす
 - Requesterが推論を開始し、Peerが計算資源を提供する
 
-「PCが増えるほど必ず高速になる」ことは主目的ではなく、複数PCのメモリ・計算資源を利用できることを重視しています。
-
-`Qwen3.6-35B-A3B` は現在の主要な検証候補です。モデル選定は、Runtimeの実装状況や実測結果によって変わる可能性があります。
-
-## 現在確認できていること
-
-- Webアプリ側とRuntime側は別リポジトリで開発している
-- `llama.cpp` を推論エンジンとして利用する方向で検討している
-- `llmlet` という、ブラウザ上で WASM / WebGPU / WebRTC / llama.cpp RPC を組み合わせた先行実装が存在する
-- 分散方法やモデル配置について、`llama.cpp` が提供している機能をまず確認する価値がある
+「PCが増えるほど必ず高速になる」ことは主目的ではありません。むしろ llmlet は並列化未対応で各ピアが逐次評価するため、ピアを増やしても速くはなりません (`CONSTRAINTS.md` F8)。**複数PCのメモリを利用して、1台に載らないモデルを動かせること**を重視しています。
 
 ## 現在のアーキテクチャ仮説
-
-現時点では、llmletを参考に次のような構成を考えています。
 
 ```text
 Requester Browser
@@ -51,84 +48,53 @@ Hono（別リポジトリ）
   ├─ Room / Peer管理
   ├─ WebRTC signaling
   ├─ 状態管理・UIへの通知
-  └─ モデル情報の管理
+  └─ モデル配信（GGUF。HTTP Range 対応が前提条件 → CONSTRAINTS.md O2）
 ```
 
-データプレーンについては、重いRPCデータをHonoで中継せず、RequesterとPeer間のWebRTC DataChannelで扱う構成を候補にしています。
+重いRPCデータはHonoで中継せず、RequesterとPeer間のWebRTC DataChannelで扱います (`DECISIONS.md` D5)。
 
-この構成は現時点の仮説であり、llmletや現行llama.cppを実際に動かした結果によって変更する可能性があります。
+この構成は現時点の仮説であり、実測結果によって変更する可能性があります。
 
-## Runtime側で扱いそうな領域
+## 最大のリスク
 
-現時点では、主に次の領域をこのリポジトリで扱う想定です。
+`CONSTRAINTS.md` の **O0** と **O4** が現時点の中核リスクです。
 
-- `llama.cpp` のWASMビルド
-- WebGPU backend
-- `llama.cpp RPC` のブラウザ利用
-- Requester / Peer Runtime
-- WebRTC DataChannelとRPC transportの接続
-- モデルロード
-- llama.cppが提供する範囲でのモデル分散
-- 推論・token生成
-- Runtime内部の状態やエラーを外部へ伝えるための仕組み
+- **O0 (モデル選定に直結)**: llmlet が pin している llama.cpp フォークの WebGPU バックエンドには `MUL_MAT_ID` の実装がありません。これは MoE のエキスパート FFN そのものです。RPC デバイスは「何でも実行できる」と申告し、ピア側に CPU 退避も無いため、**MoE モデルは WebGPU ピアで動きません**。`DECISIONS.md` D8 の Qwen3.6-35B-A3B は MoE です。**デモは dense モデルで組む必要があります** (F14-F16)
+- **O4 (接続性)**: `iceServers: []` でも同一 LAN なら繋がるという想定ですが、Chrome は host candidate を `.local` (mDNS) へ難読化するため、mDNS 解決が失敗する環境では疎通しません。AP isolation も同様。モデル不要・ブラウザ2台で検証でき、失敗すると全段が止まります
 
-一方、次の内容はWebアプリ側で扱う方が自然だと考えています。
+当初こちらが中核リスクと考えていた「requester がモデル全体をメモリに保持するのでは」という懸念は、**実コードを読んで否定されました**。`addRemoteFile()` がチャンク単位のストリーミングをしており (F3/F4)、また RPC ピアが1台でもいれば requester のローカルデバイスは配置対象に入りません (F17)。
 
-- React UI
-- RoomのUX
-- Honoのロスター管理
-- Hono WebSocket API
-- ハッカソン向けの画面演出
+いずれも `EXPERIMENTS.md` の段0.5 と段3 で確認します。
 
-RuntimeとWebアプリの境界も、実装を進めながら必要に応じて調整します。
+## Runtime側で扱う領域
+
+`llama.cpp` のWASMビルド / WebGPU backend / `llama.cpp RPC` のブラウザ利用 / Requester・Peer Runtime / WebRTC DataChannelとRPC transportの接続 / モデルロード / 推論・token生成 / Runtime内部の状態やエラーを外部へ伝える仕組み。
+
+React UI・RoomのUX・Honoのロスター管理・WebSocket APIはWebアプリ側で扱います。境界の詳細は `RUNTIME_INTERFACE.md` を参照。
 
 ## 既存技術との関係
 
 ### llama.cpp
 
-分散推論の中心となる候補です。
-
-モデル配置・RPC・デバイス管理などについて、まず既存機能で扱える範囲を確認します。既存機能が今回の用途に合わない場合は、その時点で追加実装や変更を検討します。
+分散推論の中心となる候補。モデル配置・RPC・デバイス管理は既存機能で扱える範囲を優先します (`DECISIONS.md` D6)。
 
 ### llmlet
 
-https://github.com/ktock/llmlet
-
-ブラウザ上で WASM + WebGPU + WebRTC + llama.cpp RPC を組み合わせた先行実装で、このプロジェクトの重要な参考資料です。
+https://github.com/ktock/llmlet — ブラウザ上で WASM + WebGPU + WebRTC + llama.cpp RPC を組み合わせた先行実装で、本プロジェクトの重要な参考資料です。MIT ライセンス (`CONSTRAINTS.md` F10)。
 
 llmletは固定したllama.cpp revisionを利用しているため、現在使いたいモデルや現行upstreamとの互換性は確認が必要です。
 
-まず既存実装を動かし、どの部分がそのまま使えそうか、どこに差分が必要かを確認する方針です。
+## まだ決めていないこと
 
-## 直近で試したいこと
-
-これは固定ロードマップではなく、現在考えている探索順です。
-
-1. llmletを手元でbuildし、小さいモデルで動作を確認する
-2. 可能であれば2ブラウザ / 2PCで既存の分散推論を確認する
-3. 現行upstream llama.cppのWASM / WebGPU周辺と、Qwen3.6対応状況を確認する
-4. llmletと現行llama.cppの差分を見て、Browser RPCをどう扱うのがよいか判断する
-5. 小さいモデルで2台の分散推論を成立させる方法を探る
-6. その後、`Qwen3.6-35B-A3B` での検証へ進む
-
-途中でより小さい検証や別の実装方法が必要になった場合は、順番を変更して構いません。
-
-## 現時点で未確定のこと
-
-次の内容はまだ調査・実測前です。
-
-- LAN限定にするか、インターネット越し参加まで対象にするか
-- STUN / TURN構成
-- Runtimeの公開API
+- Runtimeの公開API (`RUNTIME_INTERFACE.md` の P0-1〜P0-4)
 - packageとしての配布方式
 - 使用するGGUFと量子化方式
 - Requester自身のWebGPUをどう利用するか
-- モデル配布・キャッシュ方式
-- Peer増減時の挙動
+- Peer増減時の挙動の詳細
 - CPU fallbackをどこまで扱うか
 - llmletの実装をどこまで流用し、どこから変更するか
 
-必要になった時点で、既存コード・upstream仕様・実測結果を見ながら決めます。
+なお「LAN限定にするか」「STUN/TURN構成」は決定済みです (`DECISIONS.md` D1 / D7)。
 
 ## 関連リポジトリ
 

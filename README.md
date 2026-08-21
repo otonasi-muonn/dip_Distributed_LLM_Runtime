@@ -4,6 +4,17 @@ Browser-side runtime experiments for distributed LLM inference with `llama.cpp`.
 
 Project context and current hypotheses live in [`docs/AI_CONTEXT.md`](docs/AI_CONTEXT.md). Shared development guidance lives in [`AGENTS.md`](AGENTS.md).
 
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [`docs/AI_CONTEXT.md`](docs/AI_CONTEXT.md) | Entry point: project context and document index |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Settled decisions, separating product calls from verified technical facts |
+| [`docs/RUNTIME_INTERFACE.md`](docs/RUNTIME_INTERFACE.md) | The boundary this repository exposes to the web application (has open P0 items) |
+| [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) | Technical constraints, split into verified / hypothesis / open |
+| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Model-size ladder and the experiment order |
+| [`docs/handoff/web-repo-corrections.md`](docs/handoff/web-repo-corrections.md) | Findings to hand back to the web application repository |
+
 ## Current first step
 
 Before changing the Runtime architecture, reproduce the existing `llmlet` reference build.

@@ -14,6 +14,12 @@ function Require-Command([string]$Name) {
     }
 }
 
+function Assert-LastExitCode([string]$Operation) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Operation failed with exit code $LASTEXITCODE."
+    }
+}
+
 Require-Command "git"
 Require-Command "docker"
 
@@ -24,21 +30,35 @@ $ResolvedOutputDir = Join-Path $RepositoryRoot $OutputDir
 if (-not (Test-Path $ResolvedWorkDir)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $ResolvedWorkDir -Parent) | Out-Null
     git clone --recurse-submodules $LlmlletRepository $ResolvedWorkDir
+    Assert-LastExitCode "git clone"
 }
 
 Push-Location $ResolvedWorkDir
 try {
-    $Origin = (git remote get-url origin).Trim()
+    $Origin = git remote get-url origin
+    Assert-LastExitCode "git remote get-url origin"
+    $Origin = $Origin.Trim()
+
     if ($Origin -ne $LlmlletRepository) {
         throw "Existing worktree at '$ResolvedWorkDir' does not point to $LlmlletRepository."
     }
 
     git fetch origin
-    git checkout --detach $LlmlletCommit
-    git submodule sync --recursive
-    git submodule update --init --recursive
+    Assert-LastExitCode "git fetch origin"
 
-    $ActualCommit = (git rev-parse HEAD).Trim()
+    git checkout --detach $LlmlletCommit
+    Assert-LastExitCode "git checkout"
+
+    git submodule sync --recursive
+    Assert-LastExitCode "git submodule sync"
+
+    git submodule update --init --recursive
+    Assert-LastExitCode "git submodule update"
+
+    $ActualCommit = git rev-parse HEAD
+    Assert-LastExitCode "git rev-parse HEAD"
+    $ActualCommit = $ActualCommit.Trim()
+
     if ($ActualCommit -ne $LlmlletCommit) {
         throw "Expected llmlet commit $LlmlletCommit but checked out $ActualCommit."
     }
@@ -50,6 +70,7 @@ try {
 
     Write-Host "Building llmlet reference at $LlmlletCommit"
     docker build --output "type=local,dest=$ResolvedOutputDir" .
+    Assert-LastExitCode "docker build"
 
     $ExpectedArtifacts = @(
         (Join-Path $ResolvedOutputDir "llmlet-mod.js"),

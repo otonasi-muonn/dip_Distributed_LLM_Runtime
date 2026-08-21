@@ -2,17 +2,15 @@
 
 This file provides shared working guidance for AI coding agents and developers in this repository.
 
-For the current project context, hypotheses, open questions, and near-term investigation targets, read:
+Before substantive work, read `docs/AI_CONTEXT.md` for the current project context, working hypotheses, open questions, and near-term investigation targets.
 
-- `docs/AI_CONTEXT.md`
-
-`docs/AI_CONTEXT.md` is living project context and may change as implementation and experiments progress. This file focuses on the more stable development approach and repository boundaries.
+`docs/AI_CONTEXT.md` is living project context. This file is intentionally more stable and focuses on repository boundaries and the default development method.
 
 ## Repository boundary
 
 This repository is the Runtime side of the distributed LLM project.
 
-The expected output is Runtime/build artifacts that can be consumed by the separate Web application repository. A local development server or test page may be used when needed to run WASM/WebGPU in a browser, but production Web application concerns normally belong elsewhere.
+Its main output is Runtime/build artifacts that can be consumed by the separate Web application repository.
 
 Typical Runtime-side concerns include:
 
@@ -22,56 +20,82 @@ Typical Runtime-side concerns include:
 - llama.cpp RPC in a browser environment
 - browser-side Runtime glue
 - Runtime build artifacts
-- focused test or demo harnesses needed to verify the Runtime
+- focused local test pages or harnesses needed to verify the Runtime
 
-React UI, Hono application logic, room UX, and product-facing orchestration normally belong to the Web application repository unless a small local harness is needed for Runtime verification.
+Product-facing concerns such as React UI, Hono application logic, room UX, roster management, and production Web application orchestration normally belong to the Web application repository.
 
-## Default development workflow
+A temporary local server may be used when browser execution requires one for WASM/WebGPU testing. Do not introduce a production server or backend service into this repository unless the Runtime itself develops a concrete requirement for it.
 
-Use this as the default way to approach implementation work. It is a development method, not a fixed product architecture.
+## Default development method
 
-1. **Understand the current state**
-   - Read the relevant local code and `docs/AI_CONTEXT.md`.
-   - For unfamiliar llama.cpp / browser RPC behavior, inspect the relevant upstream implementation or the llmlet reference before assuming how it works.
+Use this as the normal workflow for implementation and investigation. It is more stable than the current product architecture, but it can still be revised when experience shows a better method.
 
-2. **Choose the smallest useful experiment or change**
-   - Prefer a narrow, executable step that answers one question or enables one capability.
-   - Avoid implementing surrounding future features only because they may become useful later.
+### 1. Establish the question
 
-3. **Make the change**
-   - Reuse existing llama.cpp / llmlet behavior where it fits the current problem.
-   - Add custom abstractions or infrastructure when the concrete need is visible from the code or experiment.
+Before editing code, identify the specific behavior or capability being worked on and what observation would count as success.
 
-4. **Verify the behavior that matters**
-   - Build the affected Runtime artifacts.
-   - When the change is browser-, WASM-, WebGPU-, or RPC-related, prefer an actual smoke test or runtime observation over relying only on static checks.
-   - Use logs and observed behavior to debug failures before stacking additional speculative changes.
+Read the relevant local code and `docs/AI_CONTEXT.md`. When the task depends on llama.cpp, browser RPC, WebGPU, or llmlet behavior, inspect the relevant implementation before assuming how it works.
 
-5. **Update knowledge when useful**
-   - If the work confirms or disproves an assumption that affects future development, update the relevant document in `docs/`.
-   - Keep verified facts distinct from current hypotheses and open questions.
+### 2. Prefer the smallest executable step
+
+Choose a change or experiment that answers one question or enables one concrete capability.
+
+Avoid implementing adjacent future features only because they may become useful later. Prefer reversible changes while the Runtime architecture is still being learned through implementation.
+
+### 3. Reuse before replacing
+
+Check whether llama.cpp, llmlet, the browser platform, or existing local code already provides the needed behavior before adding a parallel implementation.
+
+Reuse does not mean copying an existing implementation unchanged. If existing behavior does not fit the current requirement, make the smallest justified change and record the reason when it matters for future work.
+
+### 4. Verify the behavior, not only the code
+
+Run the most relevant verification available for the change.
+
+- Build the affected Runtime artifacts when build output is involved.
+- For browser-, WASM-, WebGPU-, RPC-, or multi-peer changes, prefer an actual smoke test or runtime observation when practical.
+- A successful compile, type check, or unit test is not by itself proof that browser/runtime behavior works.
+- Do not report a capability as working when the critical path has not actually been exercised; state what was and was not verified.
+
+### 5. Diagnose before stacking fixes
+
+When an experiment fails, first use logs, observed state, error output, or a smaller reproduction to identify the failing layer.
+
+Avoid accumulating speculative fixes across several layers at once. Change one relevant assumption at a time when practical so the result teaches us something about the Runtime.
+
+### 6. Preserve useful knowledge
+
+When work confirms or disproves an assumption that affects future development, update the relevant document in `docs/`.
+
+Keep these categories distinguishable:
+
+- verified behavior
+- current hypothesis
+- open question
+
+Do not turn every implementation detail into permanent documentation; record information that is likely to matter to later work.
 
 ## Decision guidance
 
-When several approaches are possible, generally prefer:
+When several approaches are plausible, generally prefer:
 
 - current code and observed behavior over stale documentation
-- upstream llama.cpp behavior over reimplementing equivalent functionality
+- upstream behavior over reimplementing equivalent functionality without a reason
 - a small vertical PoC over a broad speculative framework
 - reversible changes over large early abstractions
 - explicit unknowns over invented certainty
-- measuring browser/runtime behavior when static reasoning is insufficient
+- runtime measurement when static reasoning is insufficient
 
-Do not treat current architecture sketches or model choices as permanent merely because they are documented. At the same time, do not discard established working behavior without a concrete reason.
+Current architecture sketches, model choices, and implementation ideas are not permanent merely because they are documented. Working behavior should also not be discarded without a concrete reason.
 
 ## Working with external references
 
-Two important references are currently:
+Important implementation references currently include:
 
 - llama.cpp: https://github.com/ggml-org/llama.cpp
 - llmlet: https://github.com/ktock/llmlet
 
-Use them as implementation references, not as requirements to copy unchanged.
+Use them as implementation references rather than requirements to copy unchanged.
 
 ## Related project
 

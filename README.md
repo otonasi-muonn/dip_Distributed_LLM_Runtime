@@ -25,12 +25,27 @@ python scripts/serve-runtime.py <out> --port 8888        # COOP/COEP server
 ```
 
 `make-lan-bundle.py` vendors peerjs and bootstrap and pins `iceServers: []`, so the
-bundle makes no external requests. `serve-runtime.py` adds the COOP/COEP headers the
+bundle makes no external requests. `--peerserver HOST:PORT` points the page at a
+PeerServer on another machine, and `--probe` injects
+[`scripts/lan-probe.js`](scripts/lan-probe.js), which records external requests, ICE
+configuration, and candidate types. `serve-runtime.py` adds the COOP/COEP headers the
 pthread build needs; confirm `crossOriginIsolated === true` in the browser rather than
 trusting the headers alone.
 
-Signalling needs a local PeerServer (`npx --package=peer peerjs --port 9000`), started
-before the page. Open **three** tabs: the client excludes only its own peer id, so two
+Signalling needs a local PeerServer, started before the page:
+
+```bash
+npm --prefix tools/peerserver run start
+```
+
+[`tools/peerserver`](tools/peerserver) pins `peer@1.0.2` so that starting the signalling
+server does not reach npm. Run `npm install` there once while online.
+
+**What "no internet" covers.** `node_modules/` is not committed, so a fresh clone needs
+network access for `npm install`. What the LAN-only bundle demonstrates is that
+**nothing leaves the machine at run time** — it is not an offline setup story.
+
+Open **three** tabs: the client excludes only its own peer id, so two
 tabs put every layer on a single peer. See [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
 ## Current first step

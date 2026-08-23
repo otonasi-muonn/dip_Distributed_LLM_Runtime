@@ -118,6 +118,28 @@ Chrome はコンソールに理由を明示します。
 
 `setRemoteDescription` より先に candidate が到着すると throw します。WebRTC で最も頻出する不具合です。両側に「remote description 設定前の candidate を溜めておき、設定後に flush する」キューを入れてください。
 
+### 5b. Chrome の Local Network Access — 公開 origin から配信すると当たります
+
+**Runtime 側の 2PC 検証には当たりませんが、Web アプリの配信形態次第で当たります。**
+
+Chrome は「ローカルネットワーク宛ての通信」を権限プロンプトの対象にしています。WebSocket も対象です。効くかどうかは**ページの origin と接続先の組み合わせ**で決まります。
+
+| ページ origin | 接続先 | 判定 |
+|---|---|---|
+| `http://localhost` | LAN IP | **対象外。**仕様が loopback 起点を明示除外しており、Runtime 側で実測でも権限プロンプト無しで通っています |
+| **公開 origin** (デプロイした Web アプリ) | LAN IP のピア / signaling | **対象。**一次情報が一致しています |
+| LAN IP | `localhost` | **要確認。**リリースノートは対象と書き、仕様には「Chromium は現状 public→local/loopback しか enforce していない」旨の注記があって記述がズレています |
+
+含意はひとつです。**Hono やフロントをクラウド／公開 origin に置きつつ、LAN 上のピアや signaling へ繋ぐ構成にすると、参加者全員に権限プロンプトが出ます。** D1 (LAN 完結) を守る限り当たりませんが、「開発中だけ Hono を Vercel 等に置く」といった途中の構成で踏みます。
+
+採るなら次を想定してください。
+
+- 権限が拒否された場合の UI を用意する (プロンプトは拒否されうる)
+- iframe に埋める場合は Permissions Policy で委譲する
+- **早めに実機で試す** — 構成を決めてから気づくと配信方式ごと変わります
+
+3行目のケース (LAN IP のページ + localhost の signaling) を採るなら、**採用前に実測してください。**こちらでは未検証です。
+
 ### 6. peer 側が module-level の単一 `pc` を持っている
 
 ```ts

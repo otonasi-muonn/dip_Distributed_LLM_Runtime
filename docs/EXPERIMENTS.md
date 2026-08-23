@@ -9,14 +9,14 @@
 リスク分類より先に、**手を動かして1回通す**ための手順。`AGENTS.md` の「smallest executable step」に相当する。
 
 1. `llmlet-mod.js` / `llmlet-mod.wasm` と `llmlet.js`、`examples/simple/*` を同じ docroot に置く
-2. **先に** PeerServer を起動する — `npx --package=peer peerjs --port 9000` (**npm パッケージ名は `peer`、bin 名が `peerjs`**。fresh 環境では `--package` を明示する方が確実)
-   ⚠️ **ページより先に起動すること。** ページは Peer ID の取得に PeerServer を使うため、1タブ構成でも起動していないと初期化できない。既定で `::` (全インタフェース) にバインドする
+2. **先に** PeerServer を起動する — `npm --prefix tools/peerserver run start`
+   ⚠️ **ページより先に起動すること。** ページは Peer ID の取得に PeerServer を使うため、1タブ構成でも起動していないと初期化できない。`tools/peerserver` が `peer@1.0.2` を固定し、`--host 0.0.0.0 --port 9000` で起動する (`0.0.0.0` は `127.0.0.1` も含むので同一PC構成もそのまま動く)。初回だけオンラインで `npm install` が要る
 3. **COOP / COEP ヘッダ付き**で配信する — `python scripts/serve-runtime.py <docroot> --port 8888`
    `crossOriginIsolated === true` をブラウザで確認すること (ヘッダ目視では不十分)
 4. **タブを3枚**開く。各タブの Peer ID を、全タブの接続先欄に貼る (F22 により2枚では層が割れない)
 5. モデル URL に小さい dense GGUF (llmlet 実績のある SmolLM2-1.7B-Instruct-q4_k_m 等) を入れてプロンプトを投げる
 
-`examples/simple/index.html` は PeerServer アドレスを `127.0.0.1:9000` でハードコードしているので、複数PCで使うときは書き換えが要る。
+`examples/simple/index.html` は PeerServer アドレスを `127.0.0.1:9000` でハードコードしている。複数PCで使うときは書き換えが要るが、`make-lan-bundle.py --peerserver HOST:PORT` が代行する。
 
 ⚠️ 同ファイルは PeerJS 本体を `https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js` から読み込む。**素の example はインターネットが無いとページすら開かない** (`DECISIONS.md` D1 / D2 に抵触)。会場で使うなら peerjs を自前配信に差し替えること。
 
@@ -37,9 +37,10 @@
 | IndexedDB クォータ | 8.39 GB (この端末)。469 MiB のモデルで 468.6 MB 消費 |
 | モデル配信要件 | Hugging Face は HEAD + `Content-Length`、206 Range、CORS すべて満たす。**一方 `scripts/serve-runtime.py` は Range 非対応**なので、ここから GGUF を配ると非206経路になる |
 | **段2.6** LAN-only バンドル | **成功。** 外部HTTP 0件 (Resource Timing)、`RTCPeerConnection` の config は `{iceServers: []}`、ICE candidate は **host のみ** (srflx / relay なし) = STUN/TURN 未使用。ローカル配信の GGUF (Range 非対応 = F4 の非206経路) で3タブ分散推論が完走 |
+| **段2.7** localhost-origin → LAN-address self-connect | **成功。** `http://127.0.0.1:8888` のページから `192.168.0.26:9000` の PeerServer へ接続し Peer ID を取得。preflight 4項目すべて通過、外部HTTP 0件。**LNA の権限プロンプトは介在しなかった** (F25) |
 | **LAN-IP origin** (`http://192.168.0.26:8889`) → 段6 の論点 | **不可を確定 (F24)。** COOP/COEP を正しく送っても `crossOriginIsolated: false` / `SharedArrayBuffer: undefined` / `navigator.gpu: undefined`。Chrome が「origin was untrustworthy」として COOP を無視する |
 
-**次は段2.6 (LAN-only バンドル検証) → 段3 (2台の物理PC) へ。** LAN-IP origin は実測で不可と分かったので、**各PCが自機の `localhost` を開く**構成で進める (TLS 不要)。
+**次は段3 (2台の物理PC) へ。** LAN-IP origin は実測で不可と分かったので、**各PCが自機の `localhost` を開く**構成で進める (TLS 不要)。
 
 ## 梯子
 
@@ -51,6 +52,7 @@
 | **1 ✅** | 1タブ・小モデル (1〜2B 級 dense) | token が生成される。WebGPU / CPU のどちらで動いたかを記録 | medium |
 | **2 ✅** | 同一PC・**3タブ** (client 1 + server 2) + device 割当ログ | **2ピアに層が分かれた状態**で token 生成。あわせて O1 / O3 / O7 をログで確認 ⚠️ **同一 GPU / 同一メモリなので「計算資源を束ねた証明」にはならない** | medium |
 | **2.6 ✅** | **LAN-only バンドル検証** — peerjs をローカル vendor、`iceServers: []`、モデルもローカル配信 | 外部HTTP 0件 / ICE は host candidate のみ / 3タブ token 生成完走。**アダプタ遮断での再現のみ未実施** | medium |
+| **2.7 ✅** | **localhost-origin → LAN-address PeerServer self-connect ゲート (1台)** (下記) | Peer ID が表示される / preflight 4項目 / 外部HTTP 0件。**2台目を持ち込む前に潰す** | short |
 | **3 ←次** | **2台の物理PC、各自 `localhost`** (下記) — **TLS 不要** | RPC0 / RPC1 が別筐体のサーバータブに対応し、両方に layer が配置された状態で token 生成完走。あわせて O4 (mDNS / AP isolation) と転送スループット | medium |
 | 4 | Hono signaling へ差し替え | PeerJS を外し、Hono 経由で DataChannel 開通 → token 生成 | medium |
 | 5 | **1台に載らないモデルを複数PCで** | **単一タブでは載らないモデルが N ピアで動く。プロダクトの実証点であり、デモの最低ライン** | long |
@@ -80,14 +82,20 @@ fork と upstream の差分規模 (O6) はここに含めない。upstream 追�
 4. `--model` を渡せば GGUF も同梱する
 
 ```bash
-python scripts/make-lan-bundle.py <out> --model <gguf>
-npx --package=peer peerjs --port 9000
+python scripts/make-lan-bundle.py <out> --model <gguf> --probe
+npm --prefix tools/peerserver run start
 python scripts/serve-runtime.py <out> --port 8888
 ```
 
+### PeerServer 起動の穴を塞いだ
+
+当初は `npx --package=peer peerjs --port 9000` で起動していた。**バンドル自体は外部HTTP 0件だったが、PeerServer の起動だけが npm registry を叩いていた** — fresh 環境では起動時点で D1/D2 を破る。`tools/peerserver` に `peer@1.0.2` を dependency として固定し、`npm --prefix tools/peerserver run start` で起動する形にした。
+
+**offline のスコープ**: `node_modules/` は commit しないので、**fresh clone では `npm install` にインターネットが要る**。示せるのは「**準備完了後、実行中はインターネット不要**」まで。D1/D2 は**実行時の通信制約**として扱う。
+
 ### 「外部0件」の確かめ方
 
-**DevTools の Network だけでは不十分。** WebRTC の STUN/TURN は fetch/XHR 一覧に出ない。3系統で見る。
+**DevTools の Network だけでは不十分。** WebRTC の STUN/TURN は fetch/XHR 一覧に出ない。3系統で見る。観測コードは `scripts/lan-probe.js` にあり、`make-lan-bundle.py --probe` で注入される。
 
 | 対象 | 方法 | 実測結果 |
 |---|---|---|
@@ -95,7 +103,57 @@ python scripts/serve-runtime.py <out> --port 8888
 | ICE 設定 | `RTCPeerConnection` をラップして引数を記録 | **`{iceServers: []}`** |
 | 実際の ICE 経路 | 同ラッパで candidate の `typ` を収集 | **`host` のみ** (srflx / relay なし) |
 
+`chrome://webrtc-internals` で選ばれた candidate pair を見るのは**任意のクロスチェック**。ラッパ側は config も採れるのでそちらを主系にする。
+
+⚠️ **probe は `peerjs.min.js` より「後」に読み込むこと。** PeerJS 1.5.5 は module load 時の feature detection で `new RTCPeerConnection(DEFAULT_CONFIG)` + `createDataChannel("_PEERJSTEST")` を実行し、その `DEFAULT_CONFIG` は `stun:stun.l.google.com:19302` と `turn:eu-0.turn.peerjs.com` / `turn:us-0.turn.peerjs.com` を含む (実バンドルを grep して確認)。probe を前に置くと**この self-test の config を拾って「STUN/TURN を使っている」と誤検知する**。同 IIFE は `createOffer` / `setLocalDescription` を呼ばないため **ICE gathering は起きず実通信も発生しない**ので、後ろに置いて取り逃す情報は無い。`make-lan-bundle.py` が `<script>` をこの位置に挿す。
+
 **未実施**: ネットワークアダプタを物理的に遮断しての再現。観測した経路に外部は無いが、遮断試験まではやっていない。
+
+## 段2.7 — localhost-origin → LAN-address PeerServer self-connect ゲート (実施済み)
+
+段3 では PC-B のページが **PC-A の LAN IP にある PeerServer** へ繋ぐ。その配線のうち**1台で潰せる部分だけ**を、2台目・モデル・WebGPU 抜きで先に確認する。
+
+```text
+同一PC:
+  page:       http://127.0.0.1:8888     (loopback origin = secure context)
+  PeerServer: ws://192.168.0.26:9000    (自機の LAN address)
+```
+
+```bash
+python scripts/make-lan-bundle.py <out> --peerserver 192.168.0.26:9000 --probe
+npm --prefix tools/peerserver run start
+python scripts/serve-runtime.py <out> --port 8888
+```
+
+### 何が言えて、何が言えないか
+
+| | 項目 |
+|---|---|
+| **✓ 証明できる** | `peerserverAddress` の書き換え / PeerJS の host・port 設定 / PeerServer が LAN address で listen できる / **loopback origin から LAN address への HTTP + WebSocket がブラウザで成立する** / Peer ID 取得 |
+| **✗ 証明できない** | PC-B → PC-A の Windows Firewall inbound / AP isolation / 物理 LAN 経路 / 別PC間の WebRTC・DataChannel・RPC |
+
+**自機の LAN IP 宛ての接続は同一ホスト内で完結するので、物理 LAN を横断した証拠にはならない。**「段2.7 が通った = Firewall も通った」とは書かない。Firewall は段3 の頭で PC-B から `Test-NetConnection` で潰す。
+
+### 実測結果 (2026-08-23)
+
+| 確認したこと | 結果 |
+|---|---|
+| preflight | `origin: http://127.0.0.1:8888` / `isSecureContext: true` / `crossOriginIsolated: true` / `gpu: true` / `sab: "function"` |
+| Peer ID 取得 | **成功。** ページ表示 `75e65500-e673-44c2-9b66-768720824805`、PeerServer 側ログも `Client connected: 75e65500-...` で一致 |
+| 接続先 | `netstat` で `192.168.0.26:9000 <-> 192.168.0.26:50060 ESTABLISHED`。**loopback ではなく LAN address のソケットペア** |
+| 外部HTTP | **0件。** 取得資産は `127.0.0.1:8888` の4件と `192.168.0.26:9000/peerjs/id` のみ |
+| LNA 権限プロンプト | **介在しなかった** (F25)。`/peerjs/id` が 200 で返り WebSocket も開通 |
+| probe の切り分け | 記録された ICE config は **0件** — PeerJS の self-test (Google STUN + PeerJS TURN) を拾っていない。ラッパ自体は生きており、合成的に1件作ると正しく捕捉した |
+
+**ブラウザ**: Chromium 148 (Claude 内蔵ブラウザ / Electron 42.9.2)。LNA の WebSocket 拡張は Chrome 147 で入っているのでこのビルドには含まれる。**当日使う Chrome では起動時に preflight をもう一度通すこと** — 1分で済む。
+
+### 失敗したときの切り分け順
+
+1. `peerserverAddress` の書き換え漏れ — バンドルの `index.html` を grep
+2. PeerServer の bind アドレス — `netstat -an | grep :9000` が `0.0.0.0` を出しているか
+3. PeerJS の host/port パース — `peerserverAddress.split(":")` の結果
+
+**LNA は現行では該当しない** (F25) ので原因候補から外す。「権限プロンプトが出なかった = 未検証」ではなく「そもそも gate される方向ではない」。
 
 ## 段3 — 2台の物理PC、各自 `localhost` (TLS 不要)
 
@@ -126,13 +184,50 @@ GGUF は **PC-A にだけあればよい**。RPC は必要なテンソルをピ�
 
 ### 用意するもの
 
-1. `peerOptions.config = { iceServers: [] }` を明示的に渡す — llmlet は既定で設定せず、PeerJS 既定は Google STUN / PeerJS TURN を含むため (F23)、そのままだとインターネットへ出て D1/D2 に違反する
-2. PC-A でローカル PeerServer — `npx --package=peer peerjs --port 9000` (既定で全インタフェースにバインドする)
-3. PC-B 側の `peerserverAddress` を PC-A の LAN IP に向ける
+両PCとも**同じ1本のコマンド**でバンドルを作る。`--peerserver` に **PC-A の LAN IP** を渡せば、`iceServers: []` の注入 (F23 対策) と `peerserverAddress` の書き換えが同時に済む。
+
+```bash
+python scripts/make-lan-bundle.py <out> --peerserver 192.168.0.26:9000 --probe
+python scripts/serve-runtime.py <out> --port 8888     # 各PCが自機の loopback を開く
+```
+
+PeerServer は **PC-A だけ**で起動する。
+
+```bash
+npm --prefix tools/peerserver run start
+```
+
+### まず Firewall を潰す (段2.7 で証明できなかった部分)
+
+PC-B から。モデルもブラウザも要らない。
+
+```powershell
+Test-NetConnection 192.168.0.26 -Port 9000
+```
+
+ここで落ちたら Windows Firewall の inbound 規則 (Private / Public プロファイル) を疑う。**段2.7 の合格はこの経路を一切保証しない** — 自機宛ての接続は同一ホスト内で完結するため。
+
+### どのピアがどの物理PCかを記録する
+
+RPC device の index は `otherpeers` 欄の記入順で決まる (`llmlet.js:849-856` が自分を除いて `-rpc` を順に push → `main.cpp:219-222` が順に登録 → `ggml-rpc.cpp:2103` の `dev_id` が単調増加)。**requester タブの `otherpeers` 欄に、意図した順で貼ること。**
+
+| Peer ID | 物理PC | タブ役割 | `otherpeers` 欄での順位 | 対応する RPC index |
+|---|---|---|---|---|
+| | PC-A | server A | 1 | RPC0 |
+| | PC-B | server B | 2 | RPC1 |
+
+**突き合わせは2段**になる。
+
+1. `llama_model_load_from_file_impl: using device RPC0 (<peer-id>) (...) - N MiB free`
+   → **RPC index → Peer ID。** RPC backend が `dev_desc = endpoint` を入れており (`ggml-rpc.cpp:2104`)、llmlet では endpoint が Peer ID なので、この行だけで対応が取れる
+2. `load_tensors: layer N assigned to device RPCk`
+   → **層 → RPC index。** ⚠️ **この行は Peer ID を含まない** (`ggml_backend_dev_name(dev)` = `"RPC0"`)。1と繋いで読む。`LLAMA_LOG_DEBUG` なので `-d` 付きが前提 (llmlet は既定で付与)
 
 ### 合格条件
 
-**RPC0 / RPC1 がそれぞれ別の物理PCのサーバータブに対応していることをログで確認し、両方に layer が配置された状態で token 生成が完走すること。**
+**PC-A の server タブと PC-B の server タブの両方に最低1層が配置され、その状態で token 生成が完走すること。**
+
+上の表を埋めたうえで、1と2のログを両方残す。「RPC0 に layers 0-14」だけでは、**RPC0 がどの物理筐体だったかが後から辿れない**。
 
 あわせて O4 (mDNS / AP isolation) と転送スループットもここで測る。O4 はモデル不要で検証でき、失敗すると全段が止まる。
 
@@ -162,6 +257,8 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 ```
 
 **ページは HTTP のままなので、PeerServer も HTTP/WS のままでよい。**
+
+⚠️ **この経路ではページ origin が `local` address space になる**ため、段2.7 で確認した `loopback → local` の免除 (F25) は効かなくなる。**PeerServer も LAN IP で指すこと** — LAN IP のページから `localhost` の PeerServer へ繋ぐ形は `local → loopback` にあたり、Chrome のリリースノート上は LNA 対象と読める。仕様側の記述とズレているので断定はしないが、**わざわざその形にする理由が無い**。
 
 ### 経路 B: 自己署名 HTTPS
 
@@ -219,7 +316,8 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 | 条件 | 行動 |
 |---|---|
 | 段0b (再現ビルド) が通らない | **公開ビルド成果物 (段0a) で確定**し、再現ビルドは諦める |
-| 段2.6 (LAN-only) が通らない | 外部依存が残ったままでは D1/D2 を満たせない。依存元を特定して潰すまで段3 へ進まない |
+| 段2.6 (LAN-only) が通らない | **合格済み。** 再実行が必要になった場合のみ: 外部依存が残ったままでは D1/D2 を満たせないので、依存元を特定して潰すまで先へ進まない |
+| 段2.7 (LAN-address signalling) が通らない | **合格済み。** 会場の別ネットワークで再実行して落ちた場合は、PeerServer の到達性を潰すまで段3 へ進まない |
 | 段3 (2物理PC) が成立しない (O4: mDNS / AP isolation 等) | 段2 (同一PC**3タブ**) をデモ構成として**凍結**し、以降は演出とログ可視化に全振りする |
 | 段5 (1台に載らないモデル) が成立しない | 段4 までの **2PC distributed** をデモの到達点として固める |
 

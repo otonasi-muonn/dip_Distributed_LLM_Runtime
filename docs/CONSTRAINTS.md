@@ -52,6 +52,7 @@
 |---|---|---|
 | F9 | Qwen3.6-35B-A3B は実在。Apache-2.0、35B総/**3B活性 MoE**、native context 262,144、Q4_K_M ≈ 20.4GB。vision は `mmproj` 別ファイル | Qwen 公式 / ggml-org |
 | F10 | llmlet は MIT (`Copyright 2025 The LLMlet authors`)。改変・配布可だが著作権表示とライセンス文の保持が条件 | llmlet `LICENSE` |
+| **F25** | **`loopback` origin から `local` (LAN IP) 宛ての通信は Local Network Access (LNA) の対象ではない。** WICG 仕様の address space 順序は `loopback < local < public` で、local network request は「destination が initiator より **less public**」なもののみ。さらに仕様は *"Requests originating from the loopback address should not be considered local network requests"* と loopback 起点を明示除外する。**したがって各PCが自機の `http://localhost` を開き、PC-A の LAN IP の PeerServer へ繋ぐ段2.7 / 段3 の構成は、LNA が gate する方向ではない。** ⚠️ **現行 Chrome における他の address-space 組み合わせについては、ここでは主張しない** — Chrome 142/147 のリリースノートは `local → loopback` も LNA request として記述する一方、WICG 仕様には「Chromium は現状 `public → local/loopback` しか実装しておらず cross-origin local requests は enforce していない」旨の注記があり、一次情報同士がズレている。必要になった段で実測する | WICG `local-network-access` 仕様 / Chrome 142・147 リリースノート。**実測 (段2.7)**: Chromium 148 で `http://127.0.0.1:8888` のページから `http://192.168.0.26:9000/peerjs/id` の取得と WebSocket 接続が権限プロンプト無しで成立 |
 
 ## 根本原因: クライアントはピアが実際に何を実行できるか見えていない
 

@@ -1,2 +1,4 @@
 .work/
 build/
+tools/peerserver/node_modules/
+__pycache__/

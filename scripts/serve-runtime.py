@@ -50,12 +50,20 @@ def main():
     parser.add_argument(
         "--bind",
         default="127.0.0.1",
-        help="bind address; use 0.0.0.0 to reach it from another machine "
-        "(note: a plain http:// LAN IP is not a secure context, so "
-        "navigator.gpu and SharedArrayBuffer will be unavailable there - "
-        "see docs/EXPERIMENTS.md stage 2.5)",
+        help="bind address; use 0.0.0.0 to reach it from another machine",
     )
+    parser.add_argument(
+        "--cert",
+        help="PEM certificate; serves HTTPS when given. A plain http:// LAN "
+        "IP is NOT a secure context, so navigator.gpu and SharedArrayBuffer "
+        "are unavailable and COOP is ignored there (docs/CONSTRAINTS.md F24). "
+        "Reaching this server from another machine therefore requires TLS.",
+    )
+    parser.add_argument("--key", help="PEM private key for --cert")
     args = parser.parse_args()
+
+    if bool(args.cert) != bool(args.key):
+        parser.error("--cert and --key must be given together")
 
     root = pathlib.Path(args.docroot).resolve()
     if not root.is_dir():
@@ -63,7 +71,17 @@ def main():
 
     handler = functools.partial(CrossOriginIsolatedHandler, directory=str(root))
     server = http.server.ThreadingHTTPServer((args.bind, args.port), handler)
-    print(f"serving {root} at http://{args.bind}:{args.port}", flush=True)
+
+    scheme = "http"
+    if args.cert:
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=args.cert, keyfile=args.key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+
+    print(f"serving {root} at {scheme}://{args.bind}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

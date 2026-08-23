@@ -79,15 +79,40 @@ Runtime 側の調査で判明した、**モデル選定に直接効く制約**�
 
 ---
 
+### 4. 会場LANの複数PC構成には TLS が必須。QRコードでのBYOD参加とは両立しません
+
+Runtime 側で実測した結果です。**`http://<LAN IP>` ではランタイムが起動しません。**
+
+```
+origin: http://192.168.0.26:8889
+isSecureContext:     false
+crossOriginIsolated: false   ← COOP/COEP ヘッダは正しく送っている
+SharedArrayBuffer:   undefined
+navigator.gpu:       undefined
+```
+
+Chrome はコンソールに理由を明示します。
+
+> The Cross-Origin-Opener-Policy header has been ignored, because the URL's origin was untrustworthy. Please deliver the response using the HTTPS protocol. You can also use the 'localhost' origin instead.
+
+**サーバ設定では直せません。** origin が secure context でないと COOP 自体が無視され、`SharedArrayBuffer` (pthread ビルドに必須) と `navigator.gpu` の両方が消えます。`localhost` は例外扱いなので、同一PC上の複数タブだけは動きます (実際こちらで3タブの分散推論まで通っています)。
+
+含意が2つあります。
+
+1. **Hono は HTTPS で配信する必要があります。** 参加者が LAN IP で開く構成なら必須です
+2. **自己署名証明書だと、参加者全員がブラウザの証明書警告を通過する必要があります。** チーム自身の数台なら証明書を配って解決できますが、**「QRコードを映して会場の人にその場で参加してもらう」演出とは実質的に両立しません** (他人の端末に証明書を入れてもらうことになる)
+
+デモの構成を決める段階で、**参加端末をチームの管理下に限るのか、BYOD を狙うのか**を先に決めてください。後者なら正当に信頼される証明書が要ります。
+
 ## P1
 
-### 4. ICE candidate の pending キューが両側とも無い
+### 5. ICE candidate の pending キューが両側とも無い
 
 `docs/webrtc-implementation.md` は requester 側・peer 側ともに、受信した candidate を即座に `addIceCandidate` しています。
 
 `setRemoteDescription` より先に candidate が到着すると throw します。WebRTC で最も頻出する不具合です。両側に「remote description 設定前の candidate を溜めておき、設定後に flush する」キューを入れてください。
 
-### 5. peer 側が module-level の単一 `pc` を持っている
+### 6. peer 側が module-level の単一 `pc` を持っている
 
 ```ts
 let pc: RTCPeerConnection | null = null
@@ -95,7 +120,7 @@ let pc: RTCPeerConnection | null = null
 
 generation が変わって新しい offer が来たとき、**古い接続を閉じずに上書き**します。requester 側には `teardownAllConnections()` がありますが、peer 側に相当する後始末がありません。
 
-### 6. Hono スケルトンの3点
+### 7. Hono スケルトンの3点
 
 `docs/implementation-spec.md` §4.2 のスケルトンについて。
 
@@ -103,7 +128,7 @@ generation が変わって新しい offer が来たとき、**古い接続を閉
 - `onClose()` が role も進行中の generation も見ずに `generation_aborted` を無条件ブロードキャストします。requester が抜けたときや、生成していないときにも飛びます
 - `webrtc_signal` の `fromId` をクライアント入力のまま転送しています → 下記7
 
-### 7. セキュリティは「省略」ではなく「最小限は残す」
+### 8. セキュリティは「省略」ではなく「最小限は残す」
 
 `docs/comparison-with-llmlet.md` に「セキュリティ考慮を丸ごと省略できる」「会場という閉じた信頼できる空間なので正当にスキップできる」という趣旨の記述があります。
 
@@ -119,7 +144,7 @@ llama.cpp 公式は RPC について "Never run the RPC server on an open networ
 - `targetId` が roster 内に存在するか確認してから転送する
 - 想定外のピアからの DataChannel を拒否する
 
-### 8. 参加者への告知
+### 9. 参加者への告知
 
 参加者の端末が他人の推論計算を担う構成です。「あなたの端末の計算資源が使われる」ことの告知・同意導線が、Runtime 側の資料にも Web 側の資料にも見当たりませんでした。
 
@@ -131,7 +156,7 @@ llama.cpp 公式は RPC について "Never run the RPC server on an open networ
 
 ## P2
 
-### 9. `implementation-spec.md` の簡略 snippet が詳細ガイドと不整合
+### 10. `implementation-spec.md` の簡略 snippet が詳細ガイドと不整合
 
 §5.3 の `connectToPeer` について。
 
@@ -140,7 +165,7 @@ llama.cpp 公式は RPC について "Never run the RPC server on an open networ
 
 なお **`docs/webrtc-implementation.md` 側は正しく await 済み**です。WebRTC 実装全体の問題ではなく、簡略 snippet と詳細ガイドの不整合です。
 
-### 10. Notion `フロント開発(React)` が現行契約と不整合の可能性
+### 11. Notion `フロント開発(React)` が現行契約と不整合の可能性
 
 GitHub `develop` の `docs/api-contract.md` は既に **v2** で、`packages/shared-types/messages.ts` とも一致しています。**リポジトリ側は問題ありません。**
 

@@ -22,7 +22,7 @@
 
 ## 実測済みの結果 (2026-08-23)
 
-**段0b / 0.5 / 1 / 2 は達成済み。** 同一PC・3タブ・Chrome・NVIDIA Turing での結果。
+**段0b / 0.5 / 1 / 2 は達成済み。段2.5 は plain HTTP では不可と確定。** 同一PC・3タブ・Chrome・NVIDIA Turing での結果。
 
 | 確認したこと | 結果 |
 |---|---|
@@ -36,6 +36,7 @@
 | F22 (3タブ必要) | **確認。** 3タブで層分割が成立 |
 | IndexedDB クォータ | 8.39 GB (この端末)。469 MiB のモデルで 468.6 MB 消費 |
 | モデル配信要件 | Hugging Face は HEAD + `Content-Length`、206 Range、CORS すべて満たす。**一方 `scripts/serve-runtime.py` は Range 非対応**なので、ここから GGUF を配ると非206経路になる |
+| **段2.5** LAN IP (`http://192.168.0.26:8889`) | **不可を確定 (F24)。** COOP/COEP を正しく送っても `crossOriginIsolated: false` / `SharedArrayBuffer: undefined` / `navigator.gpu: undefined`。Chrome が「origin was untrustworthy」として COOP を無視する |
 
 **次は段2.5 (Secure Context) から。** ここまでは全て `127.0.0.1` で、LAN IP は未検証。
 
@@ -48,7 +49,7 @@
 | **0.5 ✅** | **静的確認2点** (下記) | 2点とも確認済み。**モデル選定をここで決める** | short |
 | **1 ✅** | 1タブ・小モデル (1〜2B 級 dense) | token が生成される。WebGPU / CPU のどちらで動いたかを記録 | medium |
 | **2 ✅** | 同一PC・**3タブ** (client 1 + server 2) + device 割当ログ | **2ピアに層が分かれた状態**で token 生成。あわせて O1 / O3 / O7 をログで確認 ⚠️ **同一 GPU / 同一メモリなので「計算資源を束ねた証明」にはならない** | medium |
-| **2.5 ←次** | **Secure Context ゲート** (下記) | LAN IP 経由で `crossOriginIsolated === true` かつ `navigator.gpu != null` かつ `typeof SharedArrayBuffer !== 'undefined'` | medium |
+| **2.5 ⛔** | **Secure Context ゲート** (下記) — **plain HTTP の LAN IP では通らないことを実測済み (F24)** | LAN IP 経由で `crossOriginIsolated === true` かつ `navigator.gpu != null` かつ `typeof SharedArrayBuffer !== 'undefined'` | medium |
 | 3 | 2台の物理PC + **O4 (接続性)** | 別筐体2台で token 生成。mDNS / AP isolation の疎通を確認。転送スループットも実測 | medium |
 | 4 | Hono signaling へ差し替え | PeerJS を外し、Hono 経由で DataChannel 開通 → token 生成 | medium |
 | 5 | **1台に載らないモデルを複数PCで** | **単一タブでは載らないモデルが N ピアで動く。プロダクトの実証点であり、デモの最低ライン** | long |
@@ -67,7 +68,7 @@ fork と upstream の差分規模 (O6) はここに含めない。upstream 追�
 
 ## 段2.5 — Secure Context ゲート (モデル不要・5分で判定)
 
-**段3 より前に必ず通すこと。** ここを飛ばすと段3 で原因不明の停止に遭う。
+**段3 より前に必ず通すこと。実測で「plain HTTP の LAN IP では通らない」ことが確定している (F24)** ので、これは仮説ではなく既知の阻害要因。
 
 `navigator.gpu` は Secure Context 限定であり、`SharedArrayBuffer` (= `-pthread` / `PROXY_TO_PTHREAD` に必須) も Secure Context + cross-origin isolation を要求する。**`http://localhost` は potentially trustworthy 扱いだが、`http://192.168.x.x` は違う。**
 
@@ -93,7 +94,15 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 
 **どちらもそれ自体が作業なので、段3 の見積もりに含めること。**
 
-**失敗時の退避**: 全員が同じ PC で複数タブ (段2 構成) に即座に戻す。
+### 検証状況 (2026-08-23)
+
+| 経路 | 状態 |
+|---|---|
+| plain `http://` LAN IP | **不可を実測 (F24)。** COOP が無視され `crossOriginIsolated: false` |
+| 経路 A: Chrome フラグ | 未検証 |
+| 経路 B: 自己署名 HTTPS | **サーバ側は動作確認済み** (`scripts/serve-runtime.py --cert --key`、curl で 200、SAN に IP を含む証明書を生成)。**ブラウザ側は未達** — 信頼していない証明書は警告で止まり、検証に使ったブラウザはナビゲーション自体を拒否した。**残る問題は技術ではなく「参加者端末に証明書をどう信頼させるか」** (O8) |
+
+**失敗時の退避**: 全員が同じ PC で複数タブ (段2 構成) に即座に戻す。**この退避先は実際に動作確認済み**なので、最低ラインは確保されている。
 
 ## 段3 の注意 — 素の llmlet は D1 / D2 を破る
 

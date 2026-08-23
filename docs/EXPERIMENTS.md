@@ -22,7 +22,7 @@
 
 ## 実測済みの結果 (2026-08-23)
 
-**段0b / 0.5 / 1 / 2 は達成済み。段2.5 は plain HTTP では不可と確定。** 同一PC・3タブ・Chrome・NVIDIA Turing での結果。
+**段0b / 0.5 / 1 / 2 は達成済み。** 同一PC・3タブ・Chrome・NVIDIA Turing での結果。あわせて **LAN-IP origin が不可であること (F24) も確定**した。
 
 | 確認したこと | 結果 |
 |---|---|
@@ -36,9 +36,9 @@
 | F22 (3タブ必要) | **確認。** 3タブで層分割が成立 |
 | IndexedDB クォータ | 8.39 GB (この端末)。469 MiB のモデルで 468.6 MB 消費 |
 | モデル配信要件 | Hugging Face は HEAD + `Content-Length`、206 Range、CORS すべて満たす。**一方 `scripts/serve-runtime.py` は Range 非対応**なので、ここから GGUF を配ると非206経路になる |
-| **段2.5** LAN IP (`http://192.168.0.26:8889`) | **不可を確定 (F24)。** COOP/COEP を正しく送っても `crossOriginIsolated: false` / `SharedArrayBuffer: undefined` / `navigator.gpu: undefined`。Chrome が「origin was untrustworthy」として COOP を無視する |
+| **LAN-IP origin** (`http://192.168.0.26:8889`) → 段6 の論点 | **不可を確定 (F24)。** COOP/COEP を正しく送っても `crossOriginIsolated: false` / `SharedArrayBuffer: undefined` / `navigator.gpu: undefined`。Chrome が「origin was untrustworthy」として COOP を無視する |
 
-**次は段2.5 (Secure Context) から。** ここまでは全て `127.0.0.1` で、LAN IP は未検証。
+**次は段2.6 (LAN-only バンドル検証) → 段3 (2台の物理PC) へ。** LAN-IP origin は実測で不可と分かったので、**各PCが自機の `localhost` を開く**構成で進める (TLS 不要)。
 
 ## 梯子
 
@@ -49,11 +49,12 @@
 | **0.5 ✅** | **静的確認2点** (下記) | 2点とも確認済み。**モデル選定をここで決める** | short |
 | **1 ✅** | 1タブ・小モデル (1〜2B 級 dense) | token が生成される。WebGPU / CPU のどちらで動いたかを記録 | medium |
 | **2 ✅** | 同一PC・**3タブ** (client 1 + server 2) + device 割当ログ | **2ピアに層が分かれた状態**で token 生成。あわせて O1 / O3 / O7 をログで確認 ⚠️ **同一 GPU / 同一メモリなので「計算資源を束ねた証明」にはならない** | medium |
-| **2.5 ⛔** | **Secure Context ゲート** (下記) — **plain HTTP の LAN IP では通らないことを実測済み (F24)** | LAN IP 経由で `crossOriginIsolated === true` かつ `navigator.gpu != null` かつ `typeof SharedArrayBuffer !== 'undefined'` | medium |
-| 3 | 2台の物理PC + **O4 (接続性)** | 別筐体2台で token 生成。mDNS / AP isolation の疎通を確認。転送スループットも実測 | medium |
+| **2.6 ←次** | **LAN-only バンドル検証** — peerjs をローカル vendor、`iceServers: []`、モデルもローカル | **インターネットに出られない状態で**3タブ token 生成が完走する。D1/D2 準拠の実証 | medium |
+| **3** | **2台の物理PC、各自 `localhost`** (下記) — **TLS 不要** | RPC0 / RPC1 が別筐体のサーバータブに対応し、両方に layer が配置された状態で token 生成完走。あわせて O4 (mDNS / AP isolation) と転送スループット | medium |
 | 4 | Hono signaling へ差し替え | PeerJS を外し、Hono 経由で DataChannel 開通 → token 生成 | medium |
 | 5 | **1台に載らないモデルを複数PCで** | **単一タブでは載らないモデルが N ピアで動く。プロダクトの実証点であり、デモの最低ライン** | long |
-| 6 | ストレッチ: より大きいモデル | 下記 | 余剰時間 |
+| 6 | **共有URL / BYOD 用の trusted secure origin** (下記) — **製品統合問題として分離** | 通常設定のブラウザで単一 URL から `crossOriginIsolated === true` | 未定 |
+| 7 | ストレッチ: より大きいモデル | 下記 | 余剰時間 |
 
 ## 段0.5 の内容 (静的確認)
 
@@ -66,13 +67,52 @@
 
 fork と upstream の差分規模 (O6) はここに含めない。upstream 追随を判断する時点で調べればよい。
 
-## 段2.5 — Secure Context ゲート (モデル不要・5分で判定)
+## 段3 — 2台の物理PC、各自 `localhost` (TLS 不要)
 
-**段3 より前に必ず通すこと。実測で「plain HTTP の LAN IP では通らない」ことが確定している (F24)** ので、これは仮説ではなく既知の阻害要因。
+**各PCが自機の `http://localhost:8888` を開く。** localhost は potentially trustworthy なので secure context になり、**TLS は要らない** (F24 は LAN-IP を origin にする構成の話)。
+
+### 3タブにする — 2タブでは資源を束ねた証明にならない
+
+requester は**自分自身の Peer ID だけ**を RPC 先から除外する (F22)。したがって同じ PC-A 上の別タブも正当な RPC ターゲットになる。
+
+```text
+PC-A (http://localhost:8888)
+├─ requester tab  (?noserver=true で自身はサーバを起動しない)
+└─ server tab A   ← PC-A の GPU
+        │
+        │ LAN WebRTC DataChannel
+        ▼
+PC-B (http://localhost:8888)
+└─ server tab B   ← PC-B の GPU
+```
+
+**PC-A requester + PC-B server の2タブだと RPC デバイスが1個しかない。** token が出ても示せるのは「PC-A が PC-B へオフロードできた」までで、「2台の資源を束ねた」にはならない。
+
+### 切り分けを純化する
+
+モデルは **requester のローカル File 選択**を使う。URL 経路にすると HEAD / Range probe / 206判定 / IndexedDB がまだ走って切り分けが濁る。File にすれば **TLS / Hono / CORS / HTTP Range / モデル配信 / インターネット**が全部落ち、検証対象が **LAN 越しの signaling / DataChannel / RPC / 物理PC間の layer 分散 / token 生成**だけになる。
+
+GGUF は **PC-A にだけあればよい**。RPC は必要なテンソルをピアへ送る構造なので、PC-B にモデルを置く必要はない。
+
+### 用意するもの
+
+1. `peerOptions.config = { iceServers: [] }` を明示的に渡す — llmlet は既定で設定せず、PeerJS 既定は Google STUN / PeerJS TURN を含むため (F23)、そのままだとインターネットへ出て D1/D2 に違反する
+2. PC-A でローカル PeerServer — `npx --package=peer peerjs --port 9000` (既定で全インタフェースにバインドする)
+3. PC-B 側の `peerserverAddress` を PC-A の LAN IP に向ける
+
+### 合格条件
+
+**RPC0 / RPC1 がそれぞれ別の物理PCのサーバータブに対応していることをログで確認し、両方に layer が配置された状態で token 生成が完走すること。**
+
+あわせて O4 (mDNS / AP isolation) と転送スループットもここで測る。O4 はモデル不要で検証でき、失敗すると全段が止まる。
+
+## 段6 — 共有URL / BYOD 用の trusted secure origin (製品統合問題)
+
+**これは Runtime の 2PC 検証とは切り離す。** 「単一の URL を配って通常設定のブラウザから開かせる」ときにだけ必要になる問題であり、**段3 の前提条件ではない** (各PCが自機の localhost を開けば済む)。
 
 `navigator.gpu` は Secure Context 限定であり、`SharedArrayBuffer` (= `-pthread` / `PROXY_TO_PTHREAD` に必須) も Secure Context + cross-origin isolation を要求する。**`http://localhost` は potentially trustworthy 扱いだが、`http://192.168.x.x` は違う。**
 
-つまり2台目の PC から LAN IP でアクセスした瞬間、`navigator.gpu` が `undefined` になり WASM が起動しない。
+つまり**参加者に LAN IP の URL を配る構成**では、その瞬間に `navigator.gpu` が `undefined` になり WASM が起動しない。
 
 **確認手順** (PC-B から PC-A のページを開き、コンソールで実行):
 
@@ -84,7 +124,14 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 
 ### 経路 A: 開発用 Chrome フラグ (推奨・軽い)
 
-各端末の Chrome に `--unsafely-treat-insecure-origin-as-secure=http://<PC-Aのローカル IP>:8888` を設定する。**ページは HTTP のままなので、PeerServer も HTTP/WS のままでよい** (QUICKSTART の構成をそのまま使える)。
+各端末の Chrome を**2つのフラグをセットで**起動する。**`--user-data-dir` を併記しないとこのスイッチは効かない** (Chromium 公式)。
+
+```text
+--user-data-dir=<専用プロファイルのパス>
+--unsafely-treat-insecure-origin-as-secure=http://<PC-Aのローカル IP>:8888
+```
+
+**ページは HTTP のままなので、PeerServer も HTTP/WS のままでよい。**
 
 ### 経路 B: 自己署名 HTTPS
 
@@ -100,23 +147,16 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 |---|---|
 | plain `http://` LAN IP | **不可を実測 (F24)。** COOP が無視され `crossOriginIsolated: false` |
 | 経路 A: Chrome フラグ | 未検証 |
-| 経路 B: 自己署名 HTTPS | **サーバ側は動作確認済み** (`scripts/serve-runtime.py --cert --key`、curl で 200、SAN に IP を含む証明書を生成)。**ブラウザ側は未達** — 信頼していない証明書は警告で止まり、検証に使ったブラウザはナビゲーション自体を拒否した。**残る問題は技術ではなく「参加者端末に証明書をどう信頼させるか」** (O8) |
+| 経路 B: 自己署名 HTTPS | **サーバ側は動作確認済み** (`scripts/serve-runtime.py --cert --key`、curl で 200、SAN に IP を含む証明書を生成)。**ブラウザ側は未達** — 信頼していない証明書は警告で止まり、検証に使ったブラウザはナビゲーション自体を拒否した。**残る問題は「参加者端末に証明書をどう信頼させるか」だけではない** — ブラウザで `isSecureContext` / `crossOriginIsolated` / `navigator.gpu` / `SharedArrayBuffer` を通すまでは **server-side 準備済み / browser end-to-end 未検証** の扱い (O8)。なお **HTTPS にしただけでは足りず**、`SharedArrayBuffer` には COOP/COEP による cross-origin isolation が引き続き必要 |
 
-**失敗時の退避**: 全員が同じ PC で複数タブ (段2 構成) に即座に戻す。**この退避先は実際に動作確認済み**なので、最低ラインは確保されている。
+**失敗時の退避**: 全員が同じ PC で複数タブ (段2 構成) に即座に戻す。ただし退避先の状態を正確に分けておく。
 
-## 段3 の注意 — 素の llmlet は D1 / D2 を破る
+| 退避先 | 状態 |
+|---|---|
+| **技術 fallback** (同一PC3タブで層分散 → token 生成) | **確認済み** |
+| **LAN-only デモ fallback** (D1/D2 準拠) | **未確認** — 段2 の実験は peerjs を unpkg CDN から、モデルを Hugging Face から取得しており、インターネットに依存していた。段2.6 で潰す |
 
-llmlet は `iceServers` を一切設定しない (F23)。PeerJS の既定 config は Google STUN と PeerJS TURN を含むため、**そのまま使うとインターネットへ出る**。`DECISIONS.md` D1 (インターネット越し通信をしない) / D2 (クラウド不使用) に違反する。
-
-段3 では次の3点をセットで用意する。
-
-1. `peerOptions: { config: { iceServers: [] } }` を明示的に渡す
-2. ローカル PeerServer を立てる — `npx --package=peer peerjs --port 9000`。**2台構成では全インタフェースにバインドすること** (公式例の `127.0.0.1:9000` はループバックのみ)。段2.5 で経路 B (HTTPS) を選んだ場合は **TLS/WSS 化も必要**
-3. `examples/simple/index.html` の `peerserverAddress = "127.0.0.1:9000"` を書き換える
-
-O4 (mDNS / AP isolation) はモデル不要で検証でき、失敗すると全段が止まるので、段2.5 と合わせて早期に潰す。
-
-## 段6 の合格条件
+## 段7 (ストレッチ) の合格条件
 
 **式にしない。** `ピア数 × 実効ヒープ ≥ 重み + KV` のような単純化は成り立たない。理由:
 
@@ -149,8 +189,8 @@ O4 (mDNS / AP isolation) はモデル不要で検証でき、失敗すると全�
 | 条件 | 行動 |
 |---|---|
 | 段0b (再現ビルド) が通らない | **公開ビルド成果物 (段0a) で確定**し、再現ビルドは諦める |
-| 段2.5 (Secure Context) が通らない | 複数PC構成を諦め、同一PC複数タブをデモ構成として凍結 |
-| 段3 (2物理PC) が成立しない | 段2 (同一PC**3タブ**) をデモ構成として**凍結**し、以降は演出とログ可視化に全振りする |
+| 段2.6 (LAN-only) が通らない | 外部依存が残ったままでは D1/D2 を満たせない。依存元を特定して潰すまで段3 へ進まない |
+| 段3 (2物理PC) が成立しない (O4: mDNS / AP isolation 等) | 段2 (同一PC**3タブ**) をデモ構成として**凍結**し、以降は演出とログ可視化に全振りする |
 | 段5 (1台に載らないモデル) が成立しない | 段4 までの **2PC distributed** をデモの到達点として固める |
 
 **Plan B の合格条件**: **3タブ (client 1 + server 2)** で層が分かれた状態のトークン生成 + 層配分ログの画面表示。「複数の実行単位にモデルが分かれている」ことが目で見えれば、コンセプトは伝わる。

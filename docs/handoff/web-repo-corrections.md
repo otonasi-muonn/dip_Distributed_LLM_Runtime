@@ -4,7 +4,11 @@
 
 Runtime 側で llmlet と llama.cpp の実コードを読んで判明した、Web アプリ側に影響する事項です。反映するかは Web 側の判断に委ねます。
 
-**前提**: 確認時点で `apps/server/src/index.ts` は Hono の Hello World スキャフォールドのままで、`apps/web/src/` にも `hooks/` `webrtc/` はまだありません。つまり以下の多くは**「実装済みコードのバグ」ではなく「実装前に直しておくと安い仕様書の記述」**です。タイミングとしてはむしろ最良です。
+**前提**: 確認時点で `apps/server/src/index.ts` は Hono の Hello World スキャフォールドのままです。一方 **frontend は mock 境界を使って先行実装中**で、`apps/web/src/hooks/` に `clusterReducer.ts` / `useCluster.ts` / `useHonoSocket.mock.ts`、加えて `components/` `views/` `types/` `lib/` `config.ts` があります (`webrtc/` はまだありません)。
+
+つまり以下の多くは**「実装済みコードのバグ」ではなく「実装前に直しておくと安い仕様書の記述」**です。タイミングとしてはむしろ最良です。
+
+なお frontend がここまで進んでいるぶん、**Runtime API (下記1) を早めに握る価値は上がっています** — `generate(prompt)` 相当と model source が決まらないと、mock から先へ進めないためです。
 
 ---
 
@@ -79,9 +83,9 @@ Runtime 側の調査で判明した、**モデル選定に直接効く制約**�
 
 ---
 
-### 4. 会場LANの複数PC構成には TLS が必須。QRコードでのBYOD参加とは両立しません
+### 4. 参加者に URL を配る構成では TLS が要ります (自己署名だとゼロ設定 BYOD と相性が悪い)
 
-Runtime 側で実測した結果です。**`http://<LAN IP>` ではランタイムが起動しません。**
+Runtime 側で実測した結果です。**ページ origin が `http://<LAN IP>` だとランタイムが起動しません。**
 
 ```
 origin: http://192.168.0.26:8889
@@ -97,10 +101,12 @@ Chrome はコンソールに理由を明示します。
 
 **サーバ設定では直せません。** origin が secure context でないと COOP 自体が無視され、`SharedArrayBuffer` (pthread ビルドに必須) と `navigator.gpu` の両方が消えます。`localhost` は例外扱いなので、同一PC上の複数タブだけは動きます (実際こちらで3タブの分散推論まで通っています)。
 
-含意が2つあります。
+**ただしこれは「単一の URL を配って開かせる構成」の話で、複数PC構成一般の制約ではありません。** 各PCが自機の `http://localhost` を開く構成なら secure context なので TLS は不要です (Runtime 側の2PC検証はその方式で進めます)。
 
-1. **Hono は HTTPS で配信する必要があります。** 参加者が LAN IP で開く構成なら必須です
-2. **自己署名証明書だと、参加者全員がブラウザの証明書警告を通過する必要があります。** チーム自身の数台なら証明書を配って解決できますが、**「QRコードを映して会場の人にその場で参加してもらう」演出とは実質的に両立しません** (他人の端末に証明書を入れてもらうことになる)
+含意は2つです。
+
+1. **参加者が LAN IP の URL で開く構成なら、Hono は HTTPS で配信する必要があります。** なお HTTPS にしただけでは足りず、`SharedArrayBuffer` のために COOP/COEP による cross-origin isolation も引き続き必要です
+2. **自己署名証明書だと、参加者全員がブラウザの証明書警告を通過することになります。** チーム自身の数台なら証明書を配って解決できますが、**QR を読むだけのゼロ設定 BYOD とは相性が悪い**です。正当に信頼される HTTPS origin を用意できれば BYOD の道は残ります
 
 デモの構成を決める段階で、**参加端末をチームの管理下に限るのか、BYOD を狙うのか**を先に決めてください。後者なら正当に信頼される証明書が要ります。
 

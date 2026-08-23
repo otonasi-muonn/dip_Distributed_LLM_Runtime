@@ -42,9 +42,10 @@ npm --prefix tools/peerserver run start
 ```
 
 [`tools/peerserver`](tools/peerserver) pins `peer@1.0.2` so that starting the signalling
-server does not reach npm. Run `npm ci --prefix tools/peerserver` once while online —
-`npm install --prefix` does not work here, it ignores the prefix and looks for a
-`package.json` in the current directory.
+server does not reach npm. Run `npm ci --prefix tools/peerserver` once while online.
+`npm install --prefix` fails with ENOENT in this environment (npm 10.9.4); the cause is
+uninvestigated, so treat that as an observation rather than a rule about npm. `ci` is the
+better fit anyway: it requires the lockfile, fails on a mismatch, and never rewrites it.
 
 **What "no internet" covers.** `node_modules/` is not committed, so a fresh clone needs
 network access for that install. What the LAN-only bundle demonstrates is that

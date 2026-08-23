@@ -28,7 +28,7 @@
 |---|---|
 | 再現ビルド (段0b) | 完了済み。`build/reference-llmlet/` に `llmlet-mod.js` / `.wasm` (47MB)。システムログの `build: 8645 (c4b18b39d)` が pin したフォーク commit と一致 |
 | COOP / COEP | `scripts/serve-runtime.py` で `crossOriginIsolated === true`、`SharedArrayBuffer: function`、`navigator.gpu: object` を確認 |
-| WebGPU limits (段0.5-2) | `maxStorageBufferBindingSize = 2048 MiB` / `maxBufferSize = 2.00 GiB` |
+| WebGPU limits (段0.5-2) | `maxStorageBufferBindingSize = 2147483644` (≈ 2 GiB。厳密には 4 バイト小さい) / `maxBufferSize = 2147483648` (2.00 GiB)。adapter は `nvidia` / `turing`。`await __lanProbe.gpu()` で採取 |
 | **段1** 1タブ・Qwen2.5-0.5B Q4_K_M | **成功。** token 生成を確認。`WebGPU compute buffer 298.50 MiB` / `CPU compute buffer 12.01 MiB` / `graph splits = 2` |
 | **段2** 3タブ (client 1 + server 2) | **成功。** layers 0-14 → RPC0 / 15-23 → RPC1 に分割され、トークン生成まで完走。`graph splits = 3` |
 | F20 (偽の free memory) | **確認。** 2ピアとも `2048 MiB free` と申告 = `maxBufferSize` そのもの |
@@ -93,7 +93,7 @@ python scripts/serve-runtime.py <out> --port 8888
 
 **offline のスコープ**: `node_modules/` は commit しないので、**fresh clone では `npm ci --prefix tools/peerserver` にインターネットが要る**。示せるのは「**準備完了後、実行中はインターネット不要**」まで。D1/D2 は**実行時の通信制約**として扱う。
 
-⚠️ **`npm install --prefix tools/peerserver` に書き換えないこと。** npm 10.9.4 で実測した結果、`install` は `--prefix` を無視してカレントの `package.json` を読みに行き `ENOENT` で落ちる。`ci` と `run` は `--prefix` を尊重する。lockfile を commit してあるので `ci` の方が再現性の点でも正しい。
+⚠️ **`npm install --prefix tools/peerserver` に書き換えないこと。** この環境 (npm 10.9.4) では `ENOENT` になる — `--dry-run` でも同じ。**原因は未調査**であり、npm 一般の挙動として断定はしない (公式ドキュメントは `--prefix` を「cwd を変えずに別ディレクトリでコマンドを実行する」用途として載せている)。`npm ci --prefix tools/peerserver` は実測で成功する。加えて `ci` は lockfile を要求し `package.json` と不一致なら失敗し lockfile を書き換えないので、**pin した依存を再現する用途には元々こちらが適している**。
 
 ### 「外部0件」の確かめ方
 
@@ -221,15 +221,48 @@ ping は `BroadcastChannel('webrtc')` なので **PC-A 内の2タブにだけ届
    Get-NetTCPConnection -LocalPort 9000 -ErrorAction SilentlyContinue
    ```
 
-3. **同名・別内容のモデルを使う場合だけ `ChunkCache` を削除する (F26)**
+3. **PC-A で fresh PeerServer を起動** — `npm --prefix tools/peerserver run start`
+4. **キャッシュ削除 — 同じファイル名で中身の違うモデルを使う場合だけ (F26)。**
+   **内容を変えていないならこの手順ごと飛ばす**のが一番実験を汚さない。消すと RPC チャンクも道連れになる (F5)。
+   段3 は requester の**ローカル File 選択**を使うので、キーになるのは**ディスク上のファイル名**であってバンドルの basename ではない。
 
-   ```js
-   indexedDB.deleteDatabase('ChunkCache')
-   ```
+   1. Runtime タブを全部閉じる
+   2. PC-A で **requester ページだけ**開く — `http://127.0.0.1:8888/?noserver=true`
+      `?noserver=true` なら `startServer` を呼ばず (`index.html:116`)、生成を始めるまで `runClient` も走らない (`index.html:212`) ので `ChunkCache` への接続が無い
+   3. **生成は始めない**
+   4. コンソールで削除を await する
 
-   ⚠️ **必ずページを開く前に。** server タブは起動直後に DB を開くので (`llmlet.js:707`)、開いた後だと `blocked` になって進まない。
-   ⚠️ **モデルのファイル名を固有にしていればこの手順は不要。** 段3 は requester の**ローカル File 選択**を使うので、キーになるのは**ディスク上のファイル名**であってバンドルの basename ではない。
-4. **PC-A で fresh PeerServer を起動** — `npm --prefix tools/peerserver run start`
+      ```js
+      await new Promise((resolve, reject) => {
+        const req = indexedDB.deleteDatabase("ChunkCache");
+        req.onsuccess = resolve;
+        req.onerror = () => reject(req.error);
+        // blocked は「失敗」ではない。要求は pending のまま残る
+        req.onblocked = () => reject(new Error("ChunkCache deletion blocked"));
+      });
+      ```
+
+   5. `onsuccess` を確認してからページを reload する
+
+   ⚠️ **`blocked` は削除要求をキャンセルしない。** `blocked` イベントは not cancelable で、**要求は生き続け、邪魔している接続が閉じた瞬間に削除が成功する**。上の reject は「検出」であって「中止」ではない。**放置すると、あとでタブを閉じた瞬間に静かに cache が消える。**
+
+   **実測 (2026-08-23、別 origin `http://127.0.0.1:8890` で隔離して確認):**
+
+   | 手順 | 結果 |
+   |---|---|
+   | 通常ページ (server 起動あり) で上の snippet | `REJECTED: ChunkCache deletion blocked` (2ms)。`databases()` に `ChunkCache` は**残ったまま** |
+   | そのまま `?noserver=true` へ遷移し接続を閉じる | `databases()` が **`[]`** — **reject した削除が完了していた** |
+   | 対照: `?noserver=true` で開いて snippet (DB は存在) | `onsuccess` に 1ms で到達、`databases()` は `[]` |
+
+   つまり「blocked が出たので消えなかった」と判断して続行すると、**あとで消える。**
+
+   **blocked が1度でも出たら、その段3 run は中止する:**
+   1. Runtime タブを全部閉じる (pending だった削除がここで完了する)
+   2. `?noserver=true` のページだけ開き直す
+   3. 削除をもう一度実行し、**`onsuccess` まで到達すること**を確認する
+   4. そこから段3 を最初からやり直す
+
+   **合格条件は `onsuccess` に到達したことだけ。** `indexedDB.databases()` は**存在する DB の一覧であって開いている接続の一覧ではない**ので、そこに `ChunkCache` が無いことは接続が無いことの証明にならない。デバッグ表示として見るのは構わない。
 5. **PC-B から到達性を確認** — `Test-NetConnection <PC-A の LAN IP> -Port 9000`
 6. **両PCで自機の `http://localhost:8888` を開く**
 7. **両PCで preflight** — `__lanProbe.preflight()` と **`await __lanProbe.gpu()`**
@@ -247,7 +280,21 @@ ping は `BroadcastChannel('webrtc')` なので **PC-A 内の2タブにだけ届
 | server A | PC-A | requester ID |
 | server B | PC-B | requester ID |
 
-全タブに全 ID を入れても動くが、役割ごとに絞る方が RPC index の事故が減る。**繋がらないときは各サーバータブのコンソールで `rejecting connection from unexpected peer:` を探す** — 出ていれば手順9 の入れ忘れ (F27)。
+全タブに全 ID を入れても動くが、役割ごとに絞る方が RPC index の事故が減る。
+
+### 失敗したときの切り分け
+
+**signaling → WebRTC → llmlet transport → llama RPC → model execution** のどこで止まったかを、症状から1段ずつ落とす。
+
+| 症状 | 疑う層 |
+|---|---|
+| Peer ID が取れない | PeerServer / port 9000 |
+| Peer ID は取れるが DataConnection が開かない | ICE / Windows Firewall / AP isolation |
+| `rejecting connection from unexpected peer:` | `otherpeers` の入力ミス (F27) |
+| **DataConnection は開くが `using device RPC0 ...` が出ない** | **llmlet PeerManager / RPC handshake / server 側 Runtime** |
+| RPC0 / RPC1 は出るがモデルロード・生成で死ぬ | WebGPU / メモリ / model placement |
+
+**ネットワーク側か Runtime 側かを最初の1分で分ける**のが狙い。
 
 ### どのピアがどの物理PCかを記録する
 

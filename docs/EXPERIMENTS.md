@@ -9,8 +9,10 @@
 リスク分類より先に、**手を動かして1回通す**ための手順。`AGENTS.md` の「smallest executable step」に相当する。
 
 1. `llmlet-mod.js` / `llmlet-mod.wasm` と `llmlet.js`、`examples/simple/*` を同じ docroot に置く
-2. PeerServer を起動する — `npx --package=peer peerjs --port 9000` (**npm パッケージ名は `peer`、bin 名が `peerjs`**。fresh 環境では `--package` を明示する方が確実)
-3. **COOP / COEP ヘッダ付き**で `http://localhost:8888` を配信する
+2. **先に** PeerServer を起動する — `npx --package=peer peerjs --port 9000` (**npm パッケージ名は `peer`、bin 名が `peerjs`**。fresh 環境では `--package` を明示する方が確実)
+   ⚠️ **ページより先に起動すること。** ページは Peer ID の取得に PeerServer を使うため、1タブ構成でも起動していないと初期化できない。既定で `::` (全インタフェース) にバインドする
+3. **COOP / COEP ヘッダ付き**で配信する — `python scripts/serve-runtime.py <docroot> --port 8888`
+   `crossOriginIsolated === true` をブラウザで確認すること (ヘッダ目視では不十分)
 4. **タブを3枚**開く。各タブの Peer ID を、全タブの接続先欄に貼る (F22 により2枚では層が割れない)
 5. モデル URL に小さい dense GGUF (llmlet 実績のある SmolLM2-1.7B-Instruct-q4_k_m 等) を入れてプロンプトを投げる
 
@@ -18,16 +20,35 @@
 
 ⚠️ 同ファイルは PeerJS 本体を `https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js` から読み込む。**素の example はインターネットが無いとページすら開かない** (`DECISIONS.md` D1 / D2 に抵触)。会場で使うなら peerjs を自前配信に差し替えること。
 
+## 実測済みの結果 (2026-08-23)
+
+**段0b / 0.5 / 1 / 2 は達成済み。** 同一PC・3タブ・Chrome・NVIDIA Turing での結果。
+
+| 確認したこと | 結果 |
+|---|---|
+| 再現ビルド (段0b) | 完了済み。`build/reference-llmlet/` に `llmlet-mod.js` / `.wasm` (47MB)。システムログの `build: 8645 (c4b18b39d)` が pin したフォーク commit と一致 |
+| COOP / COEP | `scripts/serve-runtime.py` で `crossOriginIsolated === true`、`SharedArrayBuffer: function`、`navigator.gpu: object` を確認 |
+| WebGPU limits (段0.5-2) | `maxStorageBufferBindingSize = 2048 MiB` / `maxBufferSize = 2.00 GiB` |
+| **段1** 1タブ・Qwen2.5-0.5B Q4_K_M | **成功。** token 生成を確認。`WebGPU compute buffer 298.50 MiB` / `CPU compute buffer 12.01 MiB` / `graph splits = 2` |
+| **段2** 3タブ (client 1 + server 2) | **成功。** layers 0-14 → RPC0 / 15-23 → RPC1 に分割され、トークン生成まで完走。`graph splits = 3` |
+| F20 (偽の free memory) | **確認。** 2ピアとも `2048 MiB free` と申告 = `maxBufferSize` そのもの |
+| F21 (入力層 CPU 固定) | **確認。** `CPU model buffer size = 89.26 MiB` (Qwen2.5-0.5B は vocab 151936) |
+| F22 (3タブ必要) | **確認。** 3タブで層分割が成立 |
+| IndexedDB クォータ | 8.39 GB (この端末)。469 MiB のモデルで 468.6 MB 消費 |
+| モデル配信要件 | Hugging Face は HEAD + `Content-Length`、206 Range、CORS すべて満たす。**一方 `scripts/serve-runtime.py` は Range 非対応**なので、ここから GGUF を配ると非206経路になる |
+
+**次は段2.5 (Secure Context) から。** ここまでは全て `127.0.0.1` で、LAN IP は未検証。
+
 ## 梯子
 
 | 段 | 内容 | 合格条件 | 規模 |
 |---|---|---|---|
-| **0a** | **公開ビルド成果物でスモークテスト** | llmlet 公開デモの `llmlet-mod.js` / `.wasm` を使って QUICKSTART が通る。**再現ビルドを待たずに段1以降へ進める** | short |
-| 0b | llmlet 参照ビルド再現 (`scripts/build-llmlet-reference.ps1`) | `build/reference-llmlet/` に成果物が生成される。**バックグラウンドで並行実行し、失敗しても段1以降を止めない** | long |
-| **0.5** | **静的確認2点** (下記) | 2点とも確認済み。**モデル選定をここで決める** | short |
-| 1 | 1タブ・小モデル (1〜2B 級 dense) | token が生成される。WebGPU / CPU のどちらで動いたかを記録 | medium |
-| 2 | 同一PC・**3タブ** (client 1 + server 2) + device 割当ログ | **2ピアに層が分かれた状態**で token 生成。あわせて O1 / O3 / O7 をログで確認 ⚠️ **同一 GPU / 同一メモリなので「計算資源を束ねた証明」にはならない** | medium |
-| **2.5** | **Secure Context ゲート** (下記) | LAN IP 経由で `crossOriginIsolated === true` かつ `navigator.gpu != null` かつ `typeof SharedArrayBuffer !== 'undefined'` | medium |
+| ~~0a~~ | **不要だった** — 段0b が先に完了したため公開成果物は使わず | llmlet 公開デモの `llmlet-mod.js` / `.wasm` を使って QUICKSTART が通る。**再現ビルドを待たずに段1以降へ進める** | short |
+| **0b ✅** | llmlet 参照ビルド再現 (`scripts/build-llmlet-reference.ps1`) | `build/reference-llmlet/` に成果物が生成される。**バックグラウンドで並行実行し、失敗しても段1以降を止めない** | long |
+| **0.5 ✅** | **静的確認2点** (下記) | 2点とも確認済み。**モデル選定をここで決める** | short |
+| **1 ✅** | 1タブ・小モデル (1〜2B 級 dense) | token が生成される。WebGPU / CPU のどちらで動いたかを記録 | medium |
+| **2 ✅** | 同一PC・**3タブ** (client 1 + server 2) + device 割当ログ | **2ピアに層が分かれた状態**で token 生成。あわせて O1 / O3 / O7 をログで確認 ⚠️ **同一 GPU / 同一メモリなので「計算資源を束ねた証明」にはならない** | medium |
+| **2.5 ←次** | **Secure Context ゲート** (下記) | LAN IP 経由で `crossOriginIsolated === true` かつ `navigator.gpu != null` かつ `typeof SharedArrayBuffer !== 'undefined'` | medium |
 | 3 | 2台の物理PC + **O4 (接続性)** | 別筐体2台で token 生成。mDNS / AP isolation の疎通を確認。転送スループットも実測 | medium |
 | 4 | Hono signaling へ差し替え | PeerJS を外し、Hono 経由で DataChannel 開通 → token 生成 | medium |
 | 5 | **1台に載らないモデルを複数PCで** | **単一タブでは載らないモデルが N ピアで動く。プロダクトの実証点であり、デモの最低ライン** | long |

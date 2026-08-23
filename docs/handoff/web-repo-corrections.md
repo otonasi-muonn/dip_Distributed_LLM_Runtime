@@ -40,7 +40,7 @@ const contentLength = response.headers.get('content-length');
 const size = Number(contentLength)
 ```
 
-返らないと `size` が `NaN` になり、以降が**エラーを出さずに壊れます**。デバッグが辛い種類の failure なので、先に潰しておく価値があります。
+ヘッダが無いと `headers.get()` は `null` を返し、`Number(null)` は **0** になります。0 バイトの仮想ファイルができ、`Range: bytes=0--1` という不正なリクエストになってモデルロードが失敗します。**沈黙して壊れるのではなく、ロードエラーで落ちます。**
 
 ```bash
 curl -I http://localhost:3000/models/your-model.gguf
@@ -56,21 +56,26 @@ llmlet は `Range: bytes=0-1` で 206 を判定し、返らなければ全体を
 2. **IndexedDB のクォータ**を超えると `"failed to load model"` で即死する
 3. リロード時に途中再開が効かない
 
-優先度は P1 相当ですが、`serveStatic` が Range を返せるならその方が明確に有利です。なお Hono の serve-static は既に 206 対応が入っているはずなので、**バージョン次第で何もしなくても満たせている可能性があります**。確認だけしてください。
+優先度は P1 相当ですが、`serveStatic` が Range を返せるならその方が明確に有利です。**Range 対応の有無はこちらでは未確認です。**下記で確認してください。なお Hono の 206 対応は optional な引数として実装されている形跡があるため、**バージョンを上げるだけでは有効にならない可能性があります**。
 
 ```bash
 curl -H 'Range: bytes=0-1' -i http://localhost:3000/models/your-model.gguf
 ```
+
+**なお `curl` は CORS をテストしません。** ページ (Vite の :5173 など) と GGUF 配信 (:3000) がオリジン違いなら `Access-Control-Allow-Origin` が必要です。**curl は通るのにブラウザで落ちる**のが当日最悪の踏み方なので、実際のページから `fetch` して確認してください。
 
 ### 3. デモに使うモデルは dense を選んでください (MoE は現状動きません)
 
 Runtime 側の調査で判明した、**モデル選定に直接効く制約**です。
 
 - llmlet が pin している llama.cpp (`ktock/llama.cpp` の `rebase-20260401`) の WebGPU バックエンドには **`MUL_MAT_ID` の実装がありません** (backend 全体で grep 0 件)。これは **MoE のエキスパート FFN そのもの**です
+- 同じ理由で、**単一テンソルが実機の `maxStorageBufferBindingSize` を超えるモデル**も弾かれます。WebGPU の `supports_op` がこの値をハードゲートとして見ているためで、こちらは dense でも起こりえます
 - RPC デバイスは「何でも実行できる」と申告する実装 (`return true` + TODO コメント) なので、クライアント側は構わず MoE の演算をピアへ送ります
 - ピア側は単一バックエンドを直接呼ぶ作りで、**CPU への自動退避がありません**
 
-`docs/requirements.md` 系の資料にある `Qwen3.6-35B-A3B` は MoE です。**このままではデモに使えません。** dense モデル (7B〜14B 級) で組むことを推奨します。
+`docs/requirements.md` 系の資料にある `Qwen3.6-35B-A3B` は MoE です。**このままではデモに使えません。**
+
+**まず llmlet に実績のある 1〜2B 級の dense モデル**(SmolLM2-1.7B-Instruct-q4_k_m 等)から始めてください。ここから上げられるかは、こちらの段3 でスループットを実測してから判断します。**現時点で 7B 以上を前提に配信を用意しないでください** — 会場 Wi-Fi と DataChannel で破綻する側の数字です。
 
 ---
 

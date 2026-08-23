@@ -36,13 +36,20 @@ Runtime を読み込むページが満たすべき条件。
 | 要件 | 内容 | 合格条件 |
 |---|---|---|
 | COOP / COEP | Emscripten の pthread 利用に必須 | **ヘッダの目視ではなく、ブラウザで `crossOriginIsolated === true` を確認する** |
-| **HEAD + Content-Length** | モデルサイズを `fetch(url, {method:'HEAD'})` の `content-length` から取得している。**返らないと `node.size` が `NaN` になり静かに壊れる** ([CONSTRAINTS.md](CONSTRAINTS.md) F13) | `curl -I <url>` が `Content-Length` を返すこと。**Range より先に踏むエラー** |
+| **HEAD + Content-Length** | モデルサイズを `fetch(url, {method:'HEAD'})` の `content-length` から取得している。**ヘッダが無いと `headers.get()` が `null` を返し、`Number(null) === 0` なので `size` が 0 になる**。0 バイトの仮想ファイルができてそのまま壊れる ([CONSTRAINTS.md](CONSTRAINTS.md) F13) | `curl -I <url>` が `Content-Length` を返すこと。**Range より先に踏むエラー** |
 | GGUF 配信の Range | HTTP URL 経路を使う場合 | `curl -H 'Range: bytes=0-1' -i <url>` が **206** を返すこと。返さなくても致命傷ではないが起動が遅くなる ([CONSTRAINTS.md](CONSTRAINTS.md) O2) |
-| `-ngl` の明示 | 既定では offload 設定に触らないため、指定しないと CPU に落ちる | 起動引数に含める |
+
+## offload の既定値
+
+`-ngl` を指定しない場合でも **CPU に落ちるわけではない**。llmlet は `-ngl` 未指定時に `model_params.n_gpu_layers` を触らず、`llama_model_default_params()` の既定 `-1` が残る。フォークの `llama-model.cpp` はこれを `params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer + 1` と解決するため、**既定は全 layer offload** ([CONSTRAINTS.md](CONSTRAINTS.md) F19)。
+
+層数を意図的に絞りたいときだけ `-ngl` を明示する。
 
 ## モデル・演算子の前提
 
-Runtime が実行できるモデルは、**ピア側バックエンドの演算子カバレッジ**に制約される。現在 pin されているフォークの `ggml-webgpu` には `MUL_MAT_ID` が無く、**MoE モデルは WebGPU ピアで動かない**。ピア側に CPU フォールバックも無い ([CONSTRAINTS.md](CONSTRAINTS.md) F14-F16)。
+Runtime が実行できるモデルは、**ピア側バックエンドが実際に実行できる演算**に制約される。しかも RPC デバイスは「何でも実行できる」と申告するため、クライアントからはそれが見えない ([CONSTRAINTS.md](CONSTRAINTS.md) の「根本原因」節)。
+
+現時点で分かっている具体例は2つ。`ggml-webgpu` に `MUL_MAT_ID` が無いため **MoE モデルは WebGPU ピアで動かない** (F14)。また **単一テンソルが `maxStorageBufferBindingSize` を超えるモデル**も `supports_op` で弾かれる (F12)。どちらもピア側に CPU フォールバックが無いため行き止まりになる (F16)。
 
 Web 側にモデルを選ばせる API を作る場合、この制約を Runtime 側で検査して明示的にエラーを返すこと。黙って落ちるのが最悪。
 

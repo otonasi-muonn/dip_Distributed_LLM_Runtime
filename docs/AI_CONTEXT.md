@@ -12,7 +12,7 @@
 |---|---|
 | [DECISIONS.md](DECISIONS.md) | チームで確定した決定事項。製品判断と技術的事実を区別して記録 |
 | [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) | Runtime が Web アプリ側に提供する境界と API。**P0 未解決あり** |
-| [CONSTRAINTS.md](CONSTRAINTS.md) | 技術制約を「検証済み / 仮説 / 未解決」で分類 |
+| [CONSTRAINTS.md](CONSTRAINTS.md) | 技術制約を「検証済み / 仮説 / 未解決」で分類。**技術的事実の正本はここ** — 他文書の説明が食い違ったらこちらを優先する |
 | [EXPERIMENTS.md](EXPERIMENTS.md) | モデルサイズの梯子と実験計画 |
 | [handoff/web-repo-corrections.md](handoff/web-repo-corrections.md) | Web アプリ側リポジトリへの指摘 |
 
@@ -59,7 +59,7 @@ Hono（別リポジトリ）
 
 `CONSTRAINTS.md` の **O0** と **O4** が現時点の中核リスクです。
 
-- **O0 (モデル選定に直結)**: llmlet が pin している llama.cpp フォークの WebGPU バックエンドには `MUL_MAT_ID` の実装がありません。これは MoE のエキスパート FFN そのものです。RPC デバイスは「何でも実行できる」と申告し、ピア側に CPU 退避も無いため、**MoE モデルは WebGPU ピアで動きません**。`DECISIONS.md` D8 の Qwen3.6-35B-A3B は MoE です。**デモは dense モデルで組む必要があります** (F14-F16)
+- **O0 (モデル選定に直結)**: **ピアが実行できない演算が、実行できないまま送られてくる**という構造的な穴があります。RPC デバイスは「何でも実行できる」と申告する (F15) 一方、ピア側には CPU 退避が無い (F16) ためです。具体例は2つ — WebGPU に `MUL_MAT_ID` が無いため **MoE は動かない** (F14)、および **単一テンソルが `maxStorageBufferBindingSize` を超えるモデル**も弾かれる (F12)。`DECISIONS.md` D8 の Qwen3.6-35B-A3B は MoE です。**デモは dense モデルで組む必要があります**
 - **O4 (接続性)**: `iceServers: []` でも同一 LAN なら繋がるという想定ですが、Chrome は host candidate を `.local` (mDNS) へ難読化するため、mDNS 解決が失敗する環境では疎通しません。AP isolation も同様。モデル不要・ブラウザ2台で検証でき、失敗すると全段が止まります
 
 当初こちらが中核リスクと考えていた「requester がモデル全体をメモリに保持するのでは」という懸念は、**実コードを読んで否定されました**。`addRemoteFile()` がチャンク単位のストリーミングをしており (F3/F4)、また RPC ピアが1台でもいれば requester のローカルデバイスは配置対象に入りません (F17)。

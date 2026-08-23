@@ -11,15 +11,19 @@
 | D3 | 推論をリクエストする人数は同時1人固定 | 製品判断 | デモ映え優先。あわせて llmlet の「1サーバは同時1クライアントのみ」という制約とも一致する (F8) | Web repo `docs/requirements.md` / llmlet README |
 | D4 | ピアの増減は生成の合間に generation 番号で反映する。1トークンの生成中には反映しない | 製品判断 | 古い編成の結果を混同しないため | Web repo `docs/api-contract.md` v2 |
 | D5 | 制御プレーン = Hono WebSocket / データプレーン = WebRTC DataChannel (P2P) | 製品判断 | 重いテンソルを Hono で中継すると無線区間を2回通過するため | Web repo `docs/tech-selection-rationale.md` |
-| D6 | 層の割り当ては llama.cpp 本体に委譲する。Hono は名簿管理に徹する | **upstream 文書に基づく仮説** | RPC が重みと KV キャッシュを available memory 比例で自動配分する (F7)。⚠️ **ただし出典は upstream のドキュメントで、実際にビルドされるのは `ktock/llama.cpp` フォーク。挙動の一致は未確認** | llama.cpp `tools/rpc/README.md` |
+| D6 | 層の割り当ては llama.cpp 本体に委譲する。Hono は名簿管理に徹する | **upstream 文書に基づく仮説** | RPC が重みと KV キャッシュを available memory 比例で自動配分する (F7)。⚠️ **既知の乖離あり** — 配分の入力となる WebGPU の `get_memory` は実空きではなく `maxBufferSize` という定数を返す (F20)。**比例配分は事実上成立していない** (O7) | llama.cpp `tools/rpc/README.md` |
 | D7 | **STUN / TURN は P0 では導入しない。LAN 接続の失敗リスクを受容する** | 製品判断 | LAN 内なら host candidate だけで疎通できる想定。ただし **mDNS 解決失敗・AP isolation という失敗モードが未解決 (O4) であり、「不要」と言い切れる根拠は無い** | `CONSTRAINTS.md` O4 |
-| D8 | 主要な検証候補モデルは Qwen3.6-35B-A3B | 製品判断 | ⚠️ **MoE であるため、現状の WebGPU バックエンドでは動かない** (`CONSTRAINTS.md` F14-F16)。デモは dense モデルで組み、本モデルは別作業を前提とする条件付き将来項目として扱う | `CONSTRAINTS.md` / `EXPERIMENTS.md` |
+| D8 | 主要な検証候補モデルは Qwen3.6-35B-A3B | 製品判断 | ⚠️ **MoE であるため、現状の WebGPU バックエンドでは動かない** (`CONSTRAINTS.md` の O0 / F14)。デモは dense モデルで組み、本モデルは別作業を前提とする条件付き将来項目として扱う | `CONSTRAINTS.md` / `EXPERIMENTS.md` |
 | D9 | **llama.cpp RPC の公式警告を認識した上で、会場 LAN での稼働リスクを受容する** | 製品判断 | 公式は「Never run the RPC server on an open network or in a sensitive environment!」と明記し、実装を fragile かつ insecure な PoC としている。**ピアとして動くのは参加者個人の端末**であるため、これは技術判断ではなく運営判断として引き受ける必要がある | `CONSTRAINTS.md` F7 |
 | D10 | **参加者に対し、自分の端末の計算資源が他者の推論に使われることを事前に告知する** | 製品判断 (**要実装・未着手**) | ボランティアコンピューティング的な構成であり、告知・同意の導線が現状どの文書にも無い。またプロンプト由来の中間表現が第三者端末のメモリと IndexedDB (F5) に一時的に載る | compliance レビュー指摘 |
 
 ## D6 について
 
-元の資料は「llama.cpp が自動配分してくれる」を確定事項として扱っていたが、**根拠は upstream のドキュメント**であり、実際にビルドされるのは `ktock/llama.cpp` の `rebase-20260401` ブランチである。フォークで挙動が変わっていないことは未確認のため、種別を「仮説」に置いている。段2 の device 割当ログで確認できる。
+元の資料は「llama.cpp が自動配分してくれる」を確定事項として扱っていたが、**根拠は upstream のドキュメント**であり、実際にビルドされるのは `ktock/llama.cpp` の `rebase-20260401` ブランチである。
+
+さらに調査の結果、**既に乖離が判明している**。配分ロジックは各デバイスの `get_memory` を入力にするが、WebGPU の実装は実空き容量ではなく `maxBufferSize` (アダプタ上限の定数) を返す (F20)。したがって配分は事実上「等分」になり、`maxBufferSize` が実空きを超える端末では過剰割当から OOM になりうる (O7)。
+
+回避策の `--tensor-split` は、**llmlet `main.cpp` が `-ts` を parse していないため、使うには改造が必要**。段2 の device 割当ログで実態を確認する。
 
 ## D7 について
 
@@ -27,8 +31,16 @@
 
 ## D8 について
 
-MoE を選んだ理由 (活性 3B なので遅い相互接続に有利) が、**pin されている WebGPU バックエンドが唯一実装していない演算 (`MUL_MAT_ID`) と一致している**。デモの最低ライン (`EXPERIMENTS.md` 段5) は dense モデルで組むこと。
+MoE を選んだ理由 (活性 3B なので遅い相互接続に有利) が、**pin されている WebGPU バックエンドが実装していない演算 (`MUL_MAT_ID`) と一致している**。デモの最低ライン (`EXPERIMENTS.md` 段5) は dense モデルで組むこと。
+
+なお「ピアに CPU バックエンドも登録すれば自動で退避する」わけではない。`rpc_server` は複数バックエンドを持てる (F18) が、クライアントは RPC デバイスの実サポートを知らない (F15) ため、実際に直すには `supports_op` の TODO も併せて実装する必要がある。
 
 ## D10 について
 
-**未着手の決定事項**。Web アプリ側に参加者向けの説明・同意導線があるかは Runtime 側からは確認できていない。デモ実施前に人間が確認すること。
+**未着手の決定事項。** Web アプリ側に参加者向けの説明・同意導線があるかは Runtime 側からは確認できていない。
+
+| 項目 | 完了条件 | 優先度 | 依存 | 担当 |
+|---|---|---|---|---|
+| 参加者への告知導線 | peer 参加画面に「この端末の計算資源が他の参加者の推論に使われる」旨が表示され、参加者が同意してから RPC サーバが起動する | **デモ実施前の必須ゲート** | Web アプリ側 UI (④担当領域) | 未割当 — **人間が決めること** |
+
+Runtime 側でできるのは「同意前に `startWasmPeerServer` 相当を起動しない」という口の用意まで。表示と同意取得は Web アプリ側の担当。**デモ前にこのゲートを通ったか人間が確認する。**

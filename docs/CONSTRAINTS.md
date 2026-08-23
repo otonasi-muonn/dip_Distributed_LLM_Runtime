@@ -24,6 +24,7 @@
 |---|---|---|
 | F3 | モデルファイルは MEMFS に丸ごと常駐しない。`addRemoteFile()` が `FS.createDataFile(..., new Uint8Array(0), ...)` で空ファイルを作り `node.size = size` を設定、`stream_ops.read` オーバーライドでオンデマンド取得する。`chunkMax = 100000000` (100MB)、`maxEntries = 5`。HTTP は `Range: bytes=0-1` で 206 を判定してレンジ取得し、`"chunk:" + fileID + ...` キーで IndexedDB へキャッシュ | llmlet `llmlet.js` |
 | F4 | **`status != 206` の場合、`fetchModel()` が `response.body.getReader()` でストリーム読みし、100MB の `Uint8Array` を1本使い回して IndexedDB へ順次 `put` する。**その後 `addRemoteFile()` は通常通り設置され、読み出しは chunkcache から行われる。**WASM linear memory は増えない** | llmlet `llmlet.js` |
+| **F26** | **chunk cache のキーは内容を見ていない。** ローカル File 選択は `digestStr(file.name)` = **ファイル名だけ**、URL 指定は `digestStr(modelURL)`。`chunkCache()` は素の IndexedDB key→value ストア (`ChunkCache` / `chunks`) で、**サイズ検証も内容ハッシュもバージョンも無い**。キーが `chunk:<fileID>:<start>-<end>` なので、サイズが変わっても**重なる範囲は古い chunk を掴む** → GGUF が部分的に壊れ「再現しない失敗」になる。**顕在化する経路は一様ではない** — 非206経路は `fetchModel()` が cache ヒット判定なしで**無条件に**呼ばれ全 chunk を `put()` し直すため上書きされて表面化しにくい (`llmlet.js:657-663`)。**直撃するのは ①ローカル File 選択 (段3 はこれ) ②Range 対応 URL (段4 の Hono 等)**。回避は ①モデル固有のファイル名 ②`indexedDB.deleteDatabase('ChunkCache')`。⚠️ **消すならページを開く前** — `runServer` が起動直後に `chunkCache()` を開き (`llmlet.js:707-708`)、`index.html:116` は `?noserver=true` でなければサーバを自動起動するので、開いた後だと `deleteDatabase` が blocked になる。⚠️ **F5 の `rpcchunk:` キーは同じストアに同居する**ので、消すと RPC チャンクキャッシュも一緒に消える (O3 の再転送量を測る回では測定が変わる) | llmlet `llmlet.js:533-570,637,653,707` / `examples/simple/index.html:116` |
 | F13 | モデルサイズは `fetch(modelURL, { method: 'HEAD' })` の `content-length` から取得し `node.size` に設定する。**ヘッダが無いと `headers.get()` は `null` を返し、`Number(null) === 0` なので `size` が 0 になる**（`NaN` ではない）。0 バイトの仮想ファイルが作られ、`chunkSize = 0` → `Range: bytes=0--1` が失敗して `ErrnoError` になる (**沈黙して壊れるのではなく、ロードエラーで落ちる**) | llmlet `llmlet.js` / ECMA-262 |
 
 ### 分散・演算子
@@ -44,7 +45,8 @@
 | F19 | `llama_model_default_params()` は `n_gpu_layers = -1`。フォークの `llama-model.cpp` は `params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer + 1` と解決する。llmlet は `-ngl` 未指定時に `model_params.n_gpu_layers` を触らないため、**既定は全 layer offload** | llama.cpp フォーク `llama-model.cpp` / llmlet `main.cpp` |
 | F7 | RPC は重みと KV キャッシュの両方を "in proportion to each device's available memory" で自動配分。`--tensor-split` で手動化可。公式に「Never run the RPC server on an open network or in a sensitive environment!」と明記 | ⚠️ **upstream llama.cpp のドキュメント**。実際にビルドされるのはフォークなので、挙動の一致は未確認 |
 | F8 | 層粒度で分割されるため、**各ピアは最低1層分を保持できる必要がある**。並列化は未対応で各ピアは逐次評価。1サーバは同時に1クライアントのみ | 「1サーバ1クライアント」は `ggml-rpc.cpp:1900-1907` (`accept_peer` → `rpc_serve_client` がブロッキング) で確認。層粒度は `llama-model.cpp` の layer 割当。**並列化未対応は llmlet README のみが出典** |
-| F5 | RPC チャンク用に別系統の IndexedDB キャッシュが存在。`Module.ChunkCache.get/put`、キー `"rpcchunk:" + rawkey` | llmlet `libllmlet.js` |
+| F5 | RPC チャンクも IndexedDB にキャッシュされる。`Module.ChunkCache.get/put`、キー `"rpcchunk:" + rawkey`。⚠️ **別ストアではなくモデル chunk と同じ `ChunkCache` / `chunks` を、キーの接頭辞だけ変えて共有している** (`Module.ChunkCache` は `chunkCache()` の戻り値そのもの) — したがって DB を消すと両方消える (F26) | llmlet `libllmlet.js` / `llmlet.js:630,708` |
+| **F27** | **ping ボタンのピア発見は `BroadcastChannel('webrtc')` で、別筐体には届かない。** 同一 origin・同一 storage partition の context 間だけの通信であり、ネットワークプロトコルではない。**「効かない」ではなく「部分的に効く」のが危険** — 段3 の構成 (PC-A に requester + server A、PC-B に server B) では PC-A 内の2タブ間だけ届くので、ping を押すと `otherpeers` に **server A だけ**が `value += e.data.src + ','` で追記される。その後 server B を手入力すると、押した回数や入力順で重複や `B, A` の順序が起こりうる。**この順序が RPC0 / RPC1 を決める** (F22 と同じ経路)。受信側は `allowedPeers: (p) => options.getTargetNodes().includes(p)` で判定し、外れると `console.error("rejecting connection from unexpected peer:" + conn.peer)` を出して `conn.close()` する。**段2 / 2.6 が同一ブラウザだったので ping が全タブを埋め、`allowedPeers` は一度も噛まなかった。段3 では噛む** | llmlet `examples/simple/index.html:239-258` / `llmlet.js:133-137,730` / MDN Broadcast Channel API |
 
 ### その他
 
@@ -102,7 +104,7 @@ F18 の通り `rpc_server` 自体は複数バックエンドを持てるので�
 | **O0** | **対象モデルの全演算が、ピアのバックエンドで実行可能か** (上記「根本原因」節) | 実機の `maxStorageBufferBindingSize` を対象モデルの最大テンソルサイズと突き合わせる (F12)。MoE を使うなら F14 に該当。**デモに使うモデルを dense にするか、ピアを CPU で回すかの選択が必要** | **P0** |
 | **O4** | `iceServers: []` で本当に繋がるか。Chrome は host candidate を `.local` (mDNS) へ難読化するため、mDNS 解決が失敗する環境 (ファイアウォール / マルチキャスト遮断) では疎通しない。AP isolation も同様 | 会場相当のネットワークで 2PC 接続を試す。**「LAN だからほぼ 100% 繋がる」は過信**。モデル不要・ブラウザ2台で検証でき、失敗時のインパクトが大きいので早期に着手する | **P0** |
 | O2 | GGUF 配信元が HTTP 206 Range を返すか。返さない場合のコストは、**4GB 天井ではなく** (F4 により WASM heap は増えない) 次の3つ: ①推論開始前に GGUF 全体を先読みするため起動が遅れる ②IndexedDB クォータを超えると `"failed to load model"` で即死 ③リロード時に途中再開できない | `curl -H 'Range: bytes=0-1' -i <url>` で 206 を確認。**`options.modelFile` (ローカルファイル選択) 経路を使えば回避できる** | P1 |
-| O3 | generation 変更時の実再転送量。F3 / F5 の2系統キャッシュがどれだけ効くか | 段2/3 で chunk cache の hit/miss と実転送バイト数を取る | P1 |
+| O3 | generation 変更時の実再転送量。F3 (`chunk:`) と F5 (`rpcchunk:`) の2系統のキー空間がどれだけ効くか。**ストアは同一** (F5) なので、片方を消す手段は無い | 段2/3 で chunk cache の hit/miss と実転送バイト数を取る。⚠️ **`indexedDB.deleteDatabase('ChunkCache')` を挟むと両方消えて測定が変わる** (F26) | P1 |
 | O5 | KV キャッシュのメモリ寄与。F7 より KV も配分対象 | **262,144 は対応上限であって使用義務ではない。** PoC では `n_ctx` を 2048〜4096 に明示指定して変数を減らす | P1 |
 | **O7** | **層配分が壊れている可能性。** F7 の「available memory 比例配分」は、配分ロジックが各デバイスの `get_memory` を入力にしている。しかし WebGPU の実装は F20 の通り `maxBufferSize` を返すため、**配分の入力が実空きメモリではない**。
 

@@ -85,6 +85,45 @@
       sab: typeof SharedArrayBuffer,
     };
     console.table([row]);
+    console.log("[lan-probe] `gpu: true` only means the API exists; run await __lanProbe.gpu() for the adapter");
+    return row;
+  }
+
+  // Kept separate from preflight() so preflight can stay synchronous and run
+  // at load. `navigator.gpu` being present says nothing about whether an
+  // adapter can actually be acquired, and the limits differ per machine - on
+  // a second machine this is what separates "its GPU" from "the transport".
+  async function gpu() {
+    const row = {
+      api: !!navigator.gpu,
+      adapter: false,
+      maxStorageBufferBindingSize: null,
+      maxBufferSize: null,
+    };
+    if (navigator.gpu) {
+      let adapter = null;
+      try {
+        adapter = await navigator.gpu.requestAdapter();
+      } catch (e) {
+        row.error = String(e);
+      }
+      if (adapter) {
+        row.adapter = true;
+        row.maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize;
+        row.maxBufferSize = adapter.limits.maxBufferSize;
+        // GPUAdapterInfo exposes its fields as prototype getters, so a spread
+        // copies nothing - name them.
+        if (adapter.info) {
+          row.info = {
+            vendor: adapter.info.vendor,
+            architecture: adapter.info.architecture,
+            device: adapter.info.device,
+            description: adapter.info.description,
+          };
+        }
+      }
+    }
+    console.table([row]);
     return row;
   }
 
@@ -111,7 +150,7 @@
     return result;
   }
 
-  window.__lanProbe = { preflight, report, isLocalOrigin };
-  console.log("[lan-probe] installed; call __lanProbe.preflight() / __lanProbe.report()");
+  window.__lanProbe = { preflight, gpu, report, isLocalOrigin };
+  console.log("[lan-probe] installed; call __lanProbe.preflight() / await __lanProbe.gpu() / __lanProbe.report()");
   preflight();
 })();

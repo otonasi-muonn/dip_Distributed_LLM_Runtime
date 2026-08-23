@@ -17,8 +17,12 @@ Then, from the repository root:
     python scripts/serve-runtime.py <output-dir> --port 8888
 
 The PeerServer dependency is pinned in tools/peerserver so that starting
-it does not reach npm; run `npm install` there once while online. That
-makes the demo offline at run time, not offline from a fresh clone.
+it does not reach npm; run `npm ci` there once while online. That makes
+the demo offline at run time, not offline from a fresh clone.
+
+`--model` copies the GGUF in under its own name rather than a fixed one,
+because llmlet keys its chunk cache on a hash of the model URL and never
+checks size or content (docs/CONSTRAINTS.md F26).
 
 Open three tabs at http://localhost:8888 - one client and two servers,
 since the client excludes only its own peer id and a single remote peer
@@ -31,6 +35,7 @@ import pathlib
 import re
 import shutil
 import sys
+import urllib.parse
 import urllib.request
 
 PEERJS_URL = "https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"
@@ -212,8 +217,16 @@ def main():
         model = pathlib.Path(args.model).resolve()
         if not model.is_file():
             sys.exit(f"model not found: {model}")
-        shutil.copy2(model, out / "model.gguf")
-        print(f"  copied model.gguf ({model.stat().st_size} bytes)")
+        # Keep the source name. llmlet keys its chunk cache on a hash of the
+        # model URL with no size or content check, so copying every model to a
+        # fixed model.gguf would make different models share cache entries
+        # (docs/CONSTRAINTS.md F26). Same basename is still a collision, so
+        # this lowers the risk rather than removing it.
+        shutil.copy2(model, out / model.name)
+        url_path = "/" + urllib.parse.quote(model.name)
+        print(f"  copied model: {model.name} ({model.stat().st_size} bytes)")
+        print(f"  model URL path: {url_path}")
+        print(f"  on the default port: http://localhost:8888{url_path}")
     else:
         print("  no --model given; pick a local GGUF in the page, or serve one yourself")
 

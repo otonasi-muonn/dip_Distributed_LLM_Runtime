@@ -10,7 +10,7 @@
 
 1. `llmlet-mod.js` / `llmlet-mod.wasm` と `llmlet.js`、`examples/simple/*` を同じ docroot に置く
 2. **先に** PeerServer を起動する — `npm --prefix tools/peerserver run start`
-   ⚠️ **ページより先に起動すること。** ページは Peer ID の取得に PeerServer を使うため、1タブ構成でも起動していないと初期化できない。`tools/peerserver` が `peer@1.0.2` を固定し、`--host 0.0.0.0 --port 9000` で起動する (`0.0.0.0` は `127.0.0.1` も含むので同一PC構成もそのまま動く)。初回だけオンラインで `npm install` が要る
+   ⚠️ **ページより先に起動すること。** ページは Peer ID の取得に PeerServer を使うため、1タブ構成でも起動していないと初期化できない。`tools/peerserver` が `peer@1.0.2` を固定し、`--host 0.0.0.0 --port 9000` で起動する (`0.0.0.0` は `127.0.0.1` も含むので同一PC構成もそのまま動く)。初回だけオンラインで `npm ci --prefix tools/peerserver` が要る
 3. **COOP / COEP ヘッダ付き**で配信する — `python scripts/serve-runtime.py <docroot> --port 8888`
    `crossOriginIsolated === true` をブラウザで確認すること (ヘッダ目視では不十分)
 4. **タブを3枚**開く。各タブの Peer ID を、全タブの接続先欄に貼る (F22 により2枚では層が割れない)
@@ -91,7 +91,9 @@ python scripts/serve-runtime.py <out> --port 8888
 
 当初は `npx --package=peer peerjs --port 9000` で起動していた。**バンドル自体は外部HTTP 0件だったが、PeerServer の起動だけが npm registry を叩いていた** — fresh 環境では起動時点で D1/D2 を破る。`tools/peerserver` に `peer@1.0.2` を dependency として固定し、`npm --prefix tools/peerserver run start` で起動する形にした。
 
-**offline のスコープ**: `node_modules/` は commit しないので、**fresh clone では `npm install` にインターネットが要る**。示せるのは「**準備完了後、実行中はインターネット不要**」まで。D1/D2 は**実行時の通信制約**として扱う。
+**offline のスコープ**: `node_modules/` は commit しないので、**fresh clone では `npm ci --prefix tools/peerserver` にインターネットが要る**。示せるのは「**準備完了後、実行中はインターネット不要**」まで。D1/D2 は**実行時の通信制約**として扱う。
+
+⚠️ **`npm install --prefix tools/peerserver` に書き換えないこと。** npm 10.9.4 で実測した結果、`install` は `--prefix` を無視してカレントの `package.json` を読みに行き `ENOENT` で落ちる。`ci` と `run` は `--prefix` を尊重する。lockfile を commit してあるので `ci` の方が再現性の点でも正しい。
 
 ### 「外部0件」の確かめ方
 
@@ -143,7 +145,7 @@ python scripts/serve-runtime.py <out> --port 8888
 | 接続先 | `netstat` で `192.168.0.26:9000 <-> 192.168.0.26:50060 ESTABLISHED`。**loopback ではなく LAN address のソケットペア** |
 | 外部HTTP | **0件。** 取得資産は `127.0.0.1:8888` の4件と `192.168.0.26:9000/peerjs/id` のみ |
 | LNA 権限プロンプト | **介在しなかった** (F25)。`/peerjs/id` が 200 で返り WebSocket も開通 |
-| probe の切り分け | 記録された ICE config は **0件** — PeerJS の self-test (Google STUN + PeerJS TURN) を拾っていない。ラッパ自体は生きており、合成的に1件作ると正しく捕捉した |
+| probe の切り分け | 記録された ICE config は **0件** — PeerJS の self-test (Google STUN + PeerJS TURN) を拾っていない。ラッパ自体は生きており、合成的に1件作ると正しく捕捉した。⚠️ **これは「self-test を誤記録していない」ことの証拠であって、`iceServers: []` が実通信で使われた証拠ではない** — 段2.7 は signaling だけで DataConnection を作っていないため。後者の根拠は段2.6 (DataConnection 付きで config `{iceServers: []}` / candidate `host` のみを実測) |
 
 **ブラウザ**: Chromium 148 (Claude 内蔵ブラウザ / Electron 42.9.2)。LNA の WebSocket 拡張は Chrome 147 で入っているのでこのビルドには含まれる。**当日使う Chrome では起動時に preflight をもう一度通すこと** — 1分で済む。
 
@@ -206,6 +208,46 @@ Test-NetConnection 192.168.0.26 -Port 9000
 ```
 
 ここで落ちたら Windows Firewall の inbound 規則 (Private / Public プロファイル) を疑う。**段2.7 の合格はこの経路を一切保証しない** — 自機宛ての接続は同一ホスト内で完結するため。
+
+### 開始前チェックリスト
+
+**0. 段3 では ping ボタンを使わない (F27)。3タブすべて手入力する。**
+ping は `BroadcastChannel('webrtc')` なので **PC-A 内の2タブにだけ届く**。押すと requester の `otherpeers` に server A だけが追記され、後から server B を足すと重複や順序の汚染が起きる。**その順序が RPC0 / RPC1 を決める**ので静かに事故る。
+
+1. **古い Runtime タブを全部閉じる** — 前回 `777b5c45` / `ff4f075b` / `e8f025bb` の3枚が残っていた
+2. **stale PeerServer が居ないことを確認する** — 前回 `npx` 版が 9000 を掴んでいて測定を汚した
+
+   ```powershell
+   Get-NetTCPConnection -LocalPort 9000 -ErrorAction SilentlyContinue
+   ```
+
+3. **同名・別内容のモデルを使う場合だけ `ChunkCache` を削除する (F26)**
+
+   ```js
+   indexedDB.deleteDatabase('ChunkCache')
+   ```
+
+   ⚠️ **必ずページを開く前に。** server タブは起動直後に DB を開くので (`llmlet.js:707`)、開いた後だと `blocked` になって進まない。
+   ⚠️ **モデルのファイル名を固有にしていればこの手順は不要。** 段3 は requester の**ローカル File 選択**を使うので、キーになるのは**ディスク上のファイル名**であってバンドルの basename ではない。
+4. **PC-A で fresh PeerServer を起動** — `npm --prefix tools/peerserver run start`
+5. **PC-B から到達性を確認** — `Test-NetConnection <PC-A の LAN IP> -Port 9000`
+6. **両PCで自機の `http://localhost:8888` を開く**
+7. **両PCで preflight** — `__lanProbe.preflight()` と **`await __lanProbe.gpu()`**
+   `navigator.gpu` の存在だけでは adapter が取れる保証にならない。**PC-B の adapter と limits はここで採る** (PC-A は `maxStorageBufferBindingSize = 2147483644` / `maxBufferSize = 2147483648` / `nvidia turing`)
+8. **Peer ID → 物理PC 表を埋める** (下記)
+9. **`otherpeers` を役割ごとに手入力する** (下記)
+10. **requester から生成**
+11. **ログを突き合わせる** (下記「合格条件」)
+
+**`otherpeers` の役割表**:
+
+| タブ | 物理PC | 入れるもの |
+|---|---|---|
+| requester (`?noserver=true`) | PC-A | **server A ID, server B ID の順** — この順が RPC0 / RPC1 を決める |
+| server A | PC-A | requester ID |
+| server B | PC-B | requester ID |
+
+全タブに全 ID を入れても動くが、役割ごとに絞る方が RPC index の事故が減る。**繋がらないときは各サーバータブのコンソールで `rejecting connection from unexpected peer:` を探す** — 出ていれば手順9 の入れ忘れ (F27)。
 
 ### どのピアがどの物理PCかを記録する
 

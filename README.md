@@ -28,7 +28,10 @@ python scripts/serve-runtime.py <out> --port 8888        # COOP/COEP server
 bundle makes no external requests. `--peerserver HOST:PORT` points the page at a
 PeerServer on another machine, and `--probe` injects
 [`scripts/lan-probe.js`](scripts/lan-probe.js), which records external requests, ICE
-configuration, and candidate types. `serve-runtime.py` adds the COOP/COEP headers the
+configuration, candidate types, and the WebGPU adapter. `--model` copies the GGUF in
+under its own name rather than a fixed one, because llmlet keys its chunk cache on a
+hash of the model URL and never checks size or content
+([`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) F26). `serve-runtime.py` adds the COOP/COEP headers the
 pthread build needs; confirm `crossOriginIsolated === true` in the browser rather than
 trusting the headers alone.
 
@@ -39,10 +42,12 @@ npm --prefix tools/peerserver run start
 ```
 
 [`tools/peerserver`](tools/peerserver) pins `peer@1.0.2` so that starting the signalling
-server does not reach npm. Run `npm install` there once while online.
+server does not reach npm. Run `npm ci --prefix tools/peerserver` once while online —
+`npm install --prefix` does not work here, it ignores the prefix and looks for a
+`package.json` in the current directory.
 
 **What "no internet" covers.** `node_modules/` is not committed, so a fresh clone needs
-network access for `npm install`. What the LAN-only bundle demonstrates is that
+network access for that install. What the LAN-only bundle demonstrates is that
 **nothing leaves the machine at run time** — it is not an offline setup story.
 
 Open **three** tabs: the client excludes only its own peer id, so two

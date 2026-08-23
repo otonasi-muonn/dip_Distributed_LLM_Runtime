@@ -15,6 +15,24 @@ Project context and current hypotheses live in [`docs/AI_CONTEXT.md`](docs/AI_CO
 | [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Model-size ladder, experiment order, and measured results |
 | [`docs/handoff/web-repo-corrections.md`](docs/handoff/web-repo-corrections.md) | Findings to hand back to the web application repository |
 
+## Local runtime testing
+
+Two helpers for running the browser runtime locally:
+
+```bash
+python scripts/make-lan-bundle.py <out> --model <gguf>   # LAN-only bundle
+python scripts/serve-runtime.py <out> --port 8888        # COOP/COEP server
+```
+
+`make-lan-bundle.py` vendors peerjs and bootstrap and pins `iceServers: []`, so the
+bundle makes no external requests. `serve-runtime.py` adds the COOP/COEP headers the
+pthread build needs; confirm `crossOriginIsolated === true` in the browser rather than
+trusting the headers alone.
+
+Signalling needs a local PeerServer (`npx --package=peer peerjs --port 9000`), started
+before the page. Open **three** tabs: the client excludes only its own peer id, so two
+tabs put every layer on a single peer. See [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
+
 ## Current first step
 
 Before changing the Runtime architecture, reproduce the existing `llmlet` reference build.

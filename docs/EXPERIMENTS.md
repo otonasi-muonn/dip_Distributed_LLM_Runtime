@@ -36,6 +36,7 @@
 | F22 (3タブ必要) | **確認。** 3タブで層分割が成立 |
 | IndexedDB クォータ | 8.39 GB (この端末)。469 MiB のモデルで 468.6 MB 消費 |
 | モデル配信要件 | Hugging Face は HEAD + `Content-Length`、206 Range、CORS すべて満たす。**一方 `scripts/serve-runtime.py` は Range 非対応**なので、ここから GGUF を配ると非206経路になる |
+| **段2.6** LAN-only バンドル | **成功。** 外部HTTP 0件 (Resource Timing)、`RTCPeerConnection` の config は `{iceServers: []}`、ICE candidate は **host のみ** (srflx / relay なし) = STUN/TURN 未使用。ローカル配信の GGUF (Range 非対応 = F4 の非206経路) で3タブ分散推論が完走 |
 | **LAN-IP origin** (`http://192.168.0.26:8889`) → 段6 の論点 | **不可を確定 (F24)。** COOP/COEP を正しく送っても `crossOriginIsolated: false` / `SharedArrayBuffer: undefined` / `navigator.gpu: undefined`。Chrome が「origin was untrustworthy」として COOP を無視する |
 
 **次は段2.6 (LAN-only バンドル検証) → 段3 (2台の物理PC) へ。** LAN-IP origin は実測で不可と分かったので、**各PCが自機の `localhost` を開く**構成で進める (TLS 不要)。
@@ -49,8 +50,8 @@
 | **0.5 ✅** | **静的確認2点** (下記) | 2点とも確認済み。**モデル選定をここで決める** | short |
 | **1 ✅** | 1タブ・小モデル (1〜2B 級 dense) | token が生成される。WebGPU / CPU のどちらで動いたかを記録 | medium |
 | **2 ✅** | 同一PC・**3タブ** (client 1 + server 2) + device 割当ログ | **2ピアに層が分かれた状態**で token 生成。あわせて O1 / O3 / O7 をログで確認 ⚠️ **同一 GPU / 同一メモリなので「計算資源を束ねた証明」にはならない** | medium |
-| **2.6 ←次** | **LAN-only バンドル検証** — peerjs をローカル vendor、`iceServers: []`、モデルもローカル | **インターネットに出られない状態で**3タブ token 生成が完走する。D1/D2 準拠の実証 | medium |
-| **3** | **2台の物理PC、各自 `localhost`** (下記) — **TLS 不要** | RPC0 / RPC1 が別筐体のサーバータブに対応し、両方に layer が配置された状態で token 生成完走。あわせて O4 (mDNS / AP isolation) と転送スループット | medium |
+| **2.6 ✅** | **LAN-only バンドル検証** — peerjs をローカル vendor、`iceServers: []`、モデルもローカル配信 | 外部HTTP 0件 / ICE は host candidate のみ / 3タブ token 生成完走。**アダプタ遮断での再現のみ未実施** | medium |
+| **3 ←次** | **2台の物理PC、各自 `localhost`** (下記) — **TLS 不要** | RPC0 / RPC1 が別筐体のサーバータブに対応し、両方に layer が配置された状態で token 生成完走。あわせて O4 (mDNS / AP isolation) と転送スループット | medium |
 | 4 | Hono signaling へ差し替え | PeerJS を外し、Hono 経由で DataChannel 開通 → token 生成 | medium |
 | 5 | **1台に載らないモデルを複数PCで** | **単一タブでは載らないモデルが N ピアで動く。プロダクトの実証点であり、デモの最低ライン** | long |
 | 6 | **共有URL / BYOD 用の trusted secure origin** (下記) — **製品統合問題として分離** | 通常設定のブラウザで単一 URL から `crossOriginIsolated === true` | 未定 |
@@ -66,6 +67,35 @@
 **モデル選定の分岐**: 1 の結果により、**デモには dense モデルを使う**のが既定路線になる。
 
 fork と upstream の差分規模 (O6) はここに含めない。upstream 追随を判断する時点で調べればよい。
+
+## 段2.6 — LAN-only バンドル (実施済み)
+
+素の example は peerjs と bootstrap を CDN から読み、PeerJS は既定で Google STUN / PeerJS TURN を使う (F23)。**JS をローカル化しただけでは D1/D2 を満たさない。**
+
+`scripts/make-lan-bundle.py` が次をまとめて行う。
+
+1. `llmlet-mod.js` / `.wasm` / `llmlet.js` / `index.html` を集める
+2. peerjs と bootstrap を vendor する (この1回だけネットワークが要る)
+3. `index.html` を書き換える — CDN 参照をローカルへ、**`peerOptions.config = { iceServers: [] }` を注入**
+4. `--model` を渡せば GGUF も同梱する
+
+```bash
+python scripts/make-lan-bundle.py <out> --model <gguf>
+npx --package=peer peerjs --port 9000
+python scripts/serve-runtime.py <out> --port 8888
+```
+
+### 「外部0件」の確かめ方
+
+**DevTools の Network だけでは不十分。** WebRTC の STUN/TURN は fetch/XHR 一覧に出ない。3系統で見る。
+
+| 対象 | 方法 | 実測結果 |
+|---|---|---|
+| HTTP 資産 | `performance.getEntriesByType('resource')` を非ローカル origin でフィルタ | **0件** |
+| ICE 設定 | `RTCPeerConnection` をラップして引数を記録 | **`{iceServers: []}`** |
+| 実際の ICE 経路 | 同ラッパで candidate の `typ` を収集 | **`host` のみ** (srflx / relay なし) |
+
+**未実施**: ネットワークアダプタを物理的に遮断しての再現。観測した経路に外部は無いが、遮断試験まではやっていない。
 
 ## 段3 — 2台の物理PC、各自 `localhost` (TLS 不要)
 
@@ -154,7 +184,7 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 | 退避先 | 状態 |
 |---|---|
 | **技術 fallback** (同一PC3タブで層分散 → token 生成) | **確認済み** |
-| **LAN-only デモ fallback** (D1/D2 準拠) | **未確認** — 段2 の実験は peerjs を unpkg CDN から、モデルを Hugging Face から取得しており、インターネットに依存していた。段2.6 で潰す |
+| **LAN-only デモ fallback** (D1/D2 準拠) | **確認済み (段2.6)** — `scripts/make-lan-bundle.py` の生成物で外部HTTP 0件・ICE host のみ・token 生成完走。⚠️ **ネットワークアダプタを遮断しての再現だけは未実施**なので、「観測した通信経路には外部が無い」であって「物理的に遮断しても動く」までは示していない |
 
 ## 段7 (ストレッチ) の合格条件
 

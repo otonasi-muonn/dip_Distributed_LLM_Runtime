@@ -48,7 +48,7 @@ Hono（別リポジトリ）
   ├─ Room / Peer管理
   ├─ WebRTC signaling
   ├─ 状態管理・UIへの通知
-  └─ モデル配信（GGUF。HTTP Range 対応が前提条件 → CONSTRAINTS.md O2）
+  └─ モデル配信（GGUF。必須は HEAD + Content-Length、206 Range は推奨 → CONSTRAINTS.md F13 / O2）
 ```
 
 重いRPCデータはHonoで中継せず、RequesterとPeer間のWebRTC DataChannelで扱います (`DECISIONS.md` D5)。
@@ -62,7 +62,9 @@ Hono（別リポジトリ）
 - **O0 (モデル選定に直結)**: **ピアが実行できない演算が、実行できないまま送られてくる**という構造的な穴があります。RPC デバイスは「何でも実行できる」と申告する (F15) 一方、ピア側には CPU 退避が無い (F16) ためです。具体例は2つ — WebGPU に `MUL_MAT_ID` が無いため **MoE は動かない** (F14)、および **単一テンソルが `maxStorageBufferBindingSize` を超えるモデル**も弾かれる (F12)。`DECISIONS.md` D8 の Qwen3.6-35B-A3B は MoE です。**デモは dense モデルで組む必要があります**
 - **O4 (接続性)**: `iceServers: []` でも同一 LAN なら繋がるという想定ですが、Chrome は host candidate を `.local` (mDNS) へ難読化するため、mDNS 解決が失敗する環境では疎通しません。AP isolation も同様。モデル不要・ブラウザ2台で検証でき、失敗すると全段が止まります
 
-当初こちらが中核リスクと考えていた「requester がモデル全体をメモリに保持するのでは」という懸念は、**実コードを読んで否定されました**。`addRemoteFile()` がチャンク単位のストリーミングをしており (F3/F4)、また RPC ピアが1台でもいれば requester のローカルデバイスは配置対象に入りません (F17)。
+当初こちらが中核リスクと考えていた「requester が**モデル全体**をメモリに保持するのでは」という懸念は、実コードを読んで否定されました。`addRemoteFile()` がチャンク単位のストリーミングをしており (F3/F4)、RPC ピアが1台でもいれば requester のローカルデバイスは配置対象に入りません (F17)。
+
+**ただし requester のヒープ消費がモデル非依存になるわけではありません。** 入力層は常に CPU に固定されるため `token_embd.weight` は必ず requester 側に載ります (F21)。この下限は語彙サイズに比例するので、O1 は P1 として残っています。
 
 いずれも `EXPERIMENTS.md` の段0.5 と段3 で確認します。
 

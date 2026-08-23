@@ -13,7 +13,7 @@
 | # | 論点 | 内容 |
 |---|---|---|
 | P0-1 | **prompt 投入経路が無い** | `onToken` は出力のみ。`generate(prompt)` に相当する入力 API が存在しない。制御プレーンにも無い (Web repo `docs/api-contract.md` v2 に prompt 用メッセージは無く、生成は requester ブラウザ内で完結するため WS メッセージにはならない) |
-| P0-2 | **model source の受け渡しが未定義** | HTTP URL を渡すのか `File` を渡すのか。**URL 経路を選ぶ場合、配信元の HTTP 206 Range 対応が前提条件になる** ([CONSTRAINTS.md](CONSTRAINTS.md) O2 参照) |
+| P0-2 | **model source の受け渡しが未定義** | HTTP URL を渡すのか `File` を渡すのか。**URL 経路を選ぶ場合の必須条件は HEAD + `Content-Length`** (F13)。**206 Range は強く推奨だが必須ではない** — 非対応でも IndexedDB への全体先読みへフォールバックする (F4 / O2) |
 | P0-3 | **`startWasmPeerServer` の引数の向きが逆の疑い** | Web repo の `docs/webrtc-implementation.md` では React 側が `pc.ondatachannel` で Runtime へ channel を**渡す側**。ならば自然な形は `startWasmPeerServer(channel)`、または `startWasmPeerServer()` + `attachDataChannel(channel)` |
 | P0-4 | **ライフサイクルが未定義** | 停止 / 破棄 / generation 切替時の再初期化。多重呼び出し時の挙動 |
 
@@ -37,7 +37,7 @@ Runtime を読み込むページが満たすべき条件。
 |---|---|---|
 | COOP / COEP | Emscripten の pthread 利用に必須 | **ヘッダの目視ではなく、ブラウザで `crossOriginIsolated === true` を確認する** |
 | **HEAD + Content-Length** | モデルサイズを `fetch(url, {method:'HEAD'})` の `content-length` から取得している。**ヘッダが無いと `headers.get()` が `null` を返し、`Number(null) === 0` なので `size` が 0 になる**。0 バイトの仮想ファイルができてそのまま壊れる ([CONSTRAINTS.md](CONSTRAINTS.md) F13) | `curl -I <url>` が `Content-Length` を返すこと。**Range より先に踏むエラー** |
-| GGUF 配信の Range | HTTP URL 経路を使う場合 | `curl -H 'Range: bytes=0-1' -i <url>` が **206** を返すこと。返さなくても致命傷ではないが起動が遅くなる ([CONSTRAINTS.md](CONSTRAINTS.md) O2) |
+| GGUF 配信の Range (**推奨・必須ではない**) | HTTP URL 経路を使う場合 | `curl -H 'Range: bytes=0-1' -i <url>` が **206** を返すこと。返さなくても動くが、推論開始前に全体を先読みするため起動が遅れ、IndexedDB クォータの影響も受ける ([CONSTRAINTS.md](CONSTRAINTS.md) O2) |
 
 ## offload の既定値
 

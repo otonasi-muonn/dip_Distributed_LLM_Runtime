@@ -9,12 +9,14 @@
 リスク分類より先に、**手を動かして1回通す**ための手順。`AGENTS.md` の「smallest executable step」に相当する。
 
 1. `llmlet-mod.js` / `llmlet-mod.wasm` と `llmlet.js`、`examples/simple/*` を同じ docroot に置く
-2. PeerServer を起動する — `npx peerjs --port 9000` (**パッケージ名は `peer` だが bin 名は `peerjs`**)
+2. PeerServer を起動する — `npx --package=peer peerjs --port 9000` (**npm パッケージ名は `peer`、bin 名が `peerjs`**。fresh 環境では `--package` を明示する方が確実)
 3. **COOP / COEP ヘッダ付き**で `http://localhost:8888` を配信する
 4. **タブを3枚**開く。各タブの Peer ID を、全タブの接続先欄に貼る (F22 により2枚では層が割れない)
 5. モデル URL に小さい dense GGUF (llmlet 実績のある SmolLM2-1.7B-Instruct-q4_k_m 等) を入れてプロンプトを投げる
 
 `examples/simple/index.html` は PeerServer アドレスを `127.0.0.1:9000` でハードコードしているので、複数PCで使うときは書き換えが要る。
+
+⚠️ 同ファイルは PeerJS 本体を `https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js` から読み込む。**素の example はインターネットが無いとページすら開かない** (`DECISIONS.md` D1 / D2 に抵触)。会場で使うなら peerjs を自前配信に差し替えること。
 
 ## 梯子
 
@@ -56,7 +58,19 @@ fork と upstream の差分規模 (O6) はここに含めない。upstream 追�
 console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 ```
 
-3つとも通れば合格。通らない場合の対処は、自己署名証明書 + 全端末への信頼設定、または各端末に `--unsafely-treat-insecure-origin-as-secure` を設定するかのいずれか。**どちらもそれ自体が作業なので、段3 の見積もりに含めること。**
+3つとも通れば合格。通らない場合の対処は2経路あり、**どちらを選ぶかで PeerServer 側の扱いが変わる**。経路を混ぜると signaling で詰まる。
+
+### 経路 A: 開発用 Chrome フラグ (推奨・軽い)
+
+各端末の Chrome に `--unsafely-treat-insecure-origin-as-secure=http://<PC-Aのローカル IP>:8888` を設定する。**ページは HTTP のままなので、PeerServer も HTTP/WS のままでよい** (QUICKSTART の構成をそのまま使える)。
+
+### 経路 B: 自己署名 HTTPS
+
+ページを HTTPS で配信し、証明書を全端末に信頼させる。**この場合 PeerServer も TLS/WSS 化するか、リバースプロキシ配下に置く必要がある。**
+
+理由: PeerJS はカスタム host 利用時、ページが HTTPS なら `secure` を自動的に true にする。**ページだけ HTTPS にして PeerServer を平文の 9000 で立てると、今度は signaling 側が WSS を要求して繋がらない。**
+
+**どちらもそれ自体が作業なので、段3 の見積もりに含めること。**
 
 **失敗時の退避**: 全員が同じ PC で複数タブ (段2 構成) に即座に戻す。
 
@@ -67,7 +81,7 @@ llmlet は `iceServers` を一切設定しない (F23)。PeerJS の既定 config
 段3 では次の3点をセットで用意する。
 
 1. `peerOptions: { config: { iceServers: [] } }` を明示的に渡す
-2. ローカル PeerServer を立てる — `npx peerjs --port 9000`。**2台構成では全インタフェースにバインドすること** (公式例の `127.0.0.1:9000` はループバックのみ)
+2. ローカル PeerServer を立てる — `npx --package=peer peerjs --port 9000`。**2台構成では全インタフェースにバインドすること** (公式例の `127.0.0.1:9000` はループバックのみ)。段2.5 で経路 B (HTTPS) を選んだ場合は **TLS/WSS 化も必要**
 3. `examples/simple/index.html` の `peerserverAddress = "127.0.0.1:9000"` を書き換える
 
 O4 (mDNS / AP isolation) はモデル不要で検証でき、失敗すると全段が止まるので、段2.5 と合わせて早期に潰す。

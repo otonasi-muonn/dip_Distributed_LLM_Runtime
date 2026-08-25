@@ -312,34 +312,51 @@
   // NOT "every pair that was tried": with no polling, a pair created and
   // discarded between two snapshots is never observed at all. This is the
   // observation history, and it is named so that nobody reads more into it.
+  // Snapshots can settle out of order, so this splits into two kinds of fact:
+  //
+  //   order-independent - "was this pair ever observed / ever nominated / seen
+  //     in this state at all". A digest that settles late is still a real
+  //     observation and must not be discarded just because a newer one landed
+  //     first, or the aggregate silently loses what the earlier snapshot saw.
+  //   latest-wins - "what did it look like most recently". Only a request at
+  //     least as new as the last applied one may write these.
+  //
+  // `statesSeen` is a set, not a timeline: with out-of-order settling the
+  // arrival order is not the observation order, so it is deliberately not
+  // named in a way that implies sequence.
   function mergeObserved(rec, digest, seq) {
     if (!digest || !digest.pairs) return;
     digest.pairs.forEach((pair) => {
-      const prev = rec.pairsEverObserved[pair.id];
+      let prev = rec.pairsEverObserved[pair.id];
       if (!prev) {
-        rec.pairsEverObserved[pair.id] = {
+        prev = rec.pairsEverObserved[pair.id] = {
           id: pair.id,
           firstSeenSeq: seq,
-          lastSeenSeq: seq,
-          states: [pair.state],
-          lastState: pair.state,
-          everNominated: !!pair.nominated,
-          everSelected: !!pair.selected,
-          local: pair.local,
-          remote: pair.remote,
+          lastSeenSeq: -Infinity,
+          statesSeen: [],
+          lastState: null,
+          everNominated: false,
+          everSelected: false,
+          local: null,
+          remote: null,
         };
-        return;
       }
-      if (seq < prev.lastSeenSeq) return; // a stale digest must not rewrite
-      prev.lastSeenSeq = seq;
-      if (prev.states[prev.states.length - 1] !== pair.state) {
-        prev.states.push(pair.state);
+
+      // --- order-independent ---
+      if (seq < prev.firstSeenSeq) prev.firstSeenSeq = seq;
+      if (prev.statesSeen.indexOf(pair.state) === -1) {
+        prev.statesSeen.push(pair.state);
       }
-      prev.lastState = pair.state;
       prev.everNominated = prev.everNominated || !!pair.nominated;
       prev.everSelected = prev.everSelected || !!pair.selected;
-      prev.local = pair.local;
-      prev.remote = pair.remote;
+
+      // --- latest-wins ---
+      if (seq >= prev.lastSeenSeq) {
+        prev.lastSeenSeq = seq;
+        prev.lastState = pair.state;
+        prev.local = pair.local;
+        prev.remote = pair.remote;
+      }
     });
   }
 

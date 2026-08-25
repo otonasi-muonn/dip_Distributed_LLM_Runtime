@@ -253,7 +253,7 @@ B→A:9000 の TCP が通ったのは**片方向**で、**A→B 方向は一度�
 4. **両PCで当該ネットワークの分類を Private にする。**
    Public プロファイルは inbound を強く絞る。`Get-NetConnectionProfile` で確認する。
 5. **VPN と仮想 NIC を停止し、NIC を棚卸しする (F30)。**
-   `candidateTypes: ["host"]` は「STUN/TURN を使っていない」証拠にはなるが、**経路が意図した LAN NIC だった証明にはならない** —
+   実 candidate type が `host` のみなのは「STUN/TURN を使っていない」証拠にはなるが、**経路が意図した LAN NIC だった証明にはならない** —
    VPN・仮想・複数物理 NIC もすべて host candidate を出し、mDNS 難読化のせいで candidate アドレスからは NIC を判別できない。
    **可能なら意図した物理 NIC を各PC 1本だけ有効化する。** PC-A には Tailscale アダプタが存在するので特に注意。
 
@@ -428,12 +428,12 @@ RPC device の index は `otherpeers` 欄の記入順で決まる (`llmlet.js:84
 |---|---|
 | `connectionState` | 物理PC間の接続が `connected` に到達 |
 | `stats.selected` | **selected candidate pair を特定できる** — `selectedVia` が `transport.selectedCandidatePairId`、取れなければ fallback の `nominated+succeeded` |
-| `candidateTypes` | `host` のみ。`srflx` / `relay` が出たら **D1/D2 違反**なので不合格 |
+| `candidateTypes` | **実 candidate type が `host` のみ**、`srflx` = 0、`relay` = 0。出たら **D1/D2 違反**で不合格。⚠️ **配列の完全一致で判定しない** — gathering 終了の番兵 `"(gathering-complete)"` が同じ配列に入るので、実際の値は `["(gathering-complete)", "host"]` になりうる。**番兵は candidate type として数えない** |
 | `connectionsWithoutPeerId` | `0`。どの `RTCPeerConnection` がどのピア宛てか対応が取れていること |
 | `externalResourceCount` | `0` |
 | `mdnsLocalCandidateCount` / `mdnsRemoteCandidateCount` | **0 である必要はない。** `.local` のまま繋がったなら「mDNS がこのネットワークで解決できた」という積極的な結果で、O4 に対する答えとしてはむしろ強い |
 | `ambiguousAddressCount` | 出たらその pair の住所は**採用しない**。診断が「一意に決められなかった」と言っている状態で、推測値ではない |
-| `pairsEverObserved` | 失敗時に、**各 snapshot で観測できた pair の履歴**が残っていること |
+| `pairsEverObserved` | 失敗時に、**各 snapshot で観測できた pair の履歴**が残っていること。`statesSeen` は**観測された state の集合**であって時系列ではない (snapshot は順不同で完了しうる)。時系列が要るときは `statsSnapshots` を `seq` 順に読む |
 | NIC 棚卸し | VPN / 仮想アダプタが落ちており、意図した物理 NIC の一覧が記録されていること (F30) |
 | バンドル | PC-A / PC-B の全ファイルが**同一 SHA256** であること |
 

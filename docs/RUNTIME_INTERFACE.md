@@ -2,24 +2,9 @@
 
 このリポジトリ (Runtime) が Web アプリ側 (`RiTa-23/dip_Distributed_LLM`) に提供する境界を定義する。
 
-**現状**: Web repo の `docs/implementation-spec.md` §6 が3関数を「①コア分散基盤」= このリポジトリの責務として記載しており、同 spec は「チャット入力欄・トークン表示は①のWASM連携API確定後に接続」と書いている。つまり **Web 側は Runtime 側の API 確定を待って止まっている**。この文書を最優先で埋める理由がこれ。
+## 2026-08-25 時点の結論
 
-以下は確定 API ではなく、**Web repo が現在期待している integration surface** である。
-
-## P0 未解決 — 実装着手前に決着させる
-
-3関数だけではチャットが成立しない。細かいエラー伝播の設計より先に、この4点を決める。
-
-| # | 論点 | 内容 |
-|---|---|---|
-| P0-1 | **prompt 投入経路が無い** | `onToken` は出力のみ。`generate(prompt)` に相当する入力 API が存在しない。制御プレーンにも無い (Web repo `docs/api-contract.md` v2 に prompt 用メッセージは無く、生成は requester ブラウザ内で完結するため WS メッセージにはならない) |
-| P0-2 | **model source の受け渡しが未定義** | HTTP URL を渡すのか `File` を渡すのか。**URL 経路を選ぶ場合の必須条件は HEAD + `Content-Length`** (F13)。**206 Range は強く推奨だが必須ではない** — 非対応でも IndexedDB への全体先読みへフォールバックする (F4 / O2) |
-| P0-3 | **`startWasmPeerServer` の引数の向きが逆の疑い** | Web repo の `docs/webrtc-implementation.md` では React 側が `pc.ondatachannel` で Runtime へ channel を**渡す側**。ならば自然な形は `startWasmPeerServer(channel)`、または `startWasmPeerServer()` + `attachDataChannel(channel)` |
-| P0-4 | **ライフサイクルが未定義** | 停止 / 破棄 / generation 切替時の再初期化。多重呼び出し時の挙動 |
-
-## Web 側が現在期待している3関数
-
-出典: Web repo `docs/implementation-spec.md` §6 (原文ママ)
+以前想定していた次の3関数は、現在の責務分担ではそのまま実装しない。
 
 ```ts
 startWasmClient(dataChannels: Record<string, RTCDataChannel>): Promise<void>
@@ -27,64 +12,294 @@ onToken(callback: (token: string, done: boolean) => void): void
 startWasmPeerServer(onDataChannel: (channel: RTCDataChannel) => void): Promise<void>
 ```
 
-P0-1〜P0-4 を反映した形に変わる前提で扱うこと。この3関数をそのまま確定として実装しない。
+Web repo 側ではすでに Hono signaling / `RTCPeerConnection` / `RTCDataChannel` の確立と、llmlet の C/JS bridge が要求する `Module.PeerManager` の実装まで存在する。
+
+したがって Runtime は **WebRTC 接続そのものを作らない**。Web 側が開いた DataChannel を載せた `PeerManager` を Runtime の Emscripten Module に注入する。
+
+```text
+Web repo
+  Hono signaling
+      ↓
+  RTCPeerConnection / RTCDataChannel
+      ↓
+  apps/web/src/webrtc/peerManager.ts
+      ↓ inject
+Runtime
+  Module.PeerManager
+      ↓
+  libllmlet.js bridge
+      ↓
+  patched llama.cpp RPC
+```
+
+この境界なら、PeerJS は参照実装・実験 harness にだけ残し、本番 Web アプリのデータプレーンには持ち込まない。
+
+## Runtime が Web 側へ渡すもの
+
+最低限の成果物は次の3つ。
+
+```text
+llmlet-mod.js
+llmlet-mod.wasm
+Runtime adapter (本書の契約を実装する薄い JS glue)
+```
+
+`llmlet-mod.js` / `.wasm` は pin 済み llmlet commit `730bad2f5b4d6598f55b09eb22d54b5bf2a467ed` の再現ビルドを基準にする。
+
+pin 済み Makefile はすでに以下を満たす。
+
+- `-sEXPORT_ES6=1`
+- `-sMEMORY64=2`
+- `-sPROXY_TO_PTHREAD`
+- `-sASYNCIFY=1`
+- `-sEXPORTED_FUNCTIONS=_main,_emscripten_force_exit`
+- `-sEXPORTED_RUNTIME_METHODS=FS,PThread,ENV,release_conn,TTY`
+
+したがって **`release_conn` を追加 export するためのビルド変更は不要**。既存成果物に含まれる。
+
+## Web 側から Runtime に渡すもの
+
+### `PeerManager`
+
+Runtime が必要とする最小契約は llmlet `libllmlet.js` と同じ。
+
+```ts
+export type RuntimePeerManager = {
+  connect(nodeId: string, done: (fd: number) => void): void
+  accept(done: (fd: number) => void): void
+  send(fd: number, data: Uint8Array): number
+  recv(
+    fd: number,
+    len: number,
+    writeCB: (chunk: Uint8Array) => void,
+    doneCB: (ok: boolean) => void,
+  ): void
+  close_connection(fd: number): number
+  register_buf(fd: number, ptr: number): void
+  close(): void
+}
+```
+
+Web repo `develop` の `apps/web/src/webrtc/peerManager.ts` がこの役を持つ。
+
+DataChannel の signaling / SDP / ICE / framing / backpressure は Web 側の責務。Runtime adapter は `RTCDataChannel` を直接管理しない。
+
+### Peer IDs
+
+Requester 起動時に、その generation で使う peer ID の**順序付き配列**を渡す。
+
+```ts
+peerIds: string[]
+```
+
+adapter はこれを llama.cpp の引数へ変換する。
+
+```text
+-rpc <peerIds[0]> -rpc <peerIds[1]> ...
+```
+
+この順序が RPC device の登録順になるため、Set や object の暗黙順序に任せない。
+
+## Runtime adapter の最小 API
+
+最初の統合では API を増やさない。必要なのは requester と peer の2役だけ。
+
+```ts
+export type ModelSource =
+  | { kind: 'file'; file: File }
+  | { kind: 'url'; url: string }
+
+export type RequesterRuntimeOptions = {
+  peerManager: RuntimePeerManager
+  peerIds: string[]
+  model: ModelSource
+  systemPrompt?: string
+  args?: string[]
+  onText?: (delta: string) => void
+  onLog?: (line: string) => void
+  onError?: (error: unknown) => void
+}
+
+export type RequesterRuntime = {
+  generate(prompt: string): Promise<void>
+  cancel(): void
+  stop(): Promise<void>
+  releaseConn(ptr: number): void
+}
+
+export type PeerRuntimeOptions = {
+  peerManager: RuntimePeerManager
+  onLog?: (line: string) => void
+  onError?: (error: unknown) => void
+  disableWebGPU?: boolean
+}
+
+export type PeerRuntime = {
+  stop(): void
+  releaseConn(ptr: number): void
+}
+
+export function startRequester(options: RequesterRuntimeOptions): RequesterRuntime
+export function startPeer(options: PeerRuntimeOptions): PeerRuntime
+```
+
+これは **実装対象の契約**。ブラウザ実測が通るまでは確定済み API と扱わない。
+
+## `onToken` ではなく `onText`
+
+現行 `main.cpp` は各 sampled token を `llama_token_to_piece()` した後 `printf()` する。
+
+しかし JS 側で観測できるストリームは TTY の文字出力であり、**callback 1回 = tokenizer token とは限らない**。
+
+そのため UI への公開名を `onToken` にすると意味が嘘になる。MVP は `onText(delta)` とする。UI のストリーミング表示にはこれで十分。
+
+将来「token 数」そのものが必要なら C++ 側に明示的な token callback を追加する。
+
+## `Module.PeerManager` だけでは足りない
+
+Web repo 側の接合点として `Module.PeerManager` と `Module.release_conn` が重要なのは正しいが、**実 Runtime 起動にはそれ以外の llmlet glue も必要**。
+
+### 必須: `Module.ChunkCache`
+
+pin 済み `libllmlet.js` の RPC cache bridge は直接
+
+```js
+Module.ChunkCache.get(...)
+Module.ChunkCache.put(...)
+```
+
+を呼ぶ。
+
+したがって requester **だけでなく peer server にも** IndexedDB `ChunkCache` wrapper を設定してから Emscripten Module を起動する必要がある。
+
+既存 llmlet の `chunkCache()` を adapter へ移植するのが最小変更。
+
+### Requester に必要なもの
+
+既存 `startClient()` / `runClient()` から PeerJS 依存だけを外し、次を残す。
+
+- `Module.PeerManager = options.peerManager`
+- `Module.ChunkCache`
+- `Module.arguments = ['-d', '-rpc', peerId, ...]`
+- local `File` または HTTP URL を `/work/model.gguf` として見せる remote-file bridge
+- `Module.pending_prompt`
+- `Module.pending_system_prompt`
+- `Module.isDecodingCancel`
+- stdout / TTY → `onText`
+- stderr → `onLog`
+- `onExit` / `onAbort`
+- `locateFile` (特に `llmlet-mod.wasm`)
+
+### Peer server に必要なもの
+
+- `Module.PeerManager = options.peerManager`
+- `Module.ChunkCache`
+- `Module.arguments = ['-d', '-rpcbackend']`
+- stdout / stderr logging
+- `onExit` / `onAbort`
+- `locateFile`
+
+つまり、**既存 llmlet のモデル・prompt・cache・lifecycle glue を再利用し、`newPeerManager()` だけを Web 側から注入された実装へ差し替える**のが正攻法。
+
+## prompt / generation の境界
+
+`main.cpp` は1回の generation が終わると、次の `get_next_prompt()` を呼んで待つ。
+
+adapter はこの性質を利用できる。
+
+1. `Module.pending_prompt(cb)` が最初に呼ばれたら requester は入力待ち
+2. `generate(prompt)` がその callback に prompt を渡す
+3. sampled pieces は `onText` へ流す
+4. generation が終わり `pending_prompt` が再び呼ばれた時点で `generate()` の Promise を resolve
+
+出力末尾の改行を解析して generation 完了を推測する必要はない。
+
+同時に複数 `generate()` は受け付けない。
+
+## lifecycle — まだ P0
+
+### Requester の peer 増減
+
+RPC device は process 起動時の `-rpc` 引数で登録する。したがって peer roster が変わる generation では requester Runtime の再起動が必要。
+
+既存 llmlet の `/restart` は `_emscripten_force_exit(0)` を使うが、実測で次の cleanup exception を再現している。
+
+```text
+RuntimeError: unreachable
+WGPUBufferImpl::Destroy()
+wgpuBufferDestroy
+webgpu_buf_pool::cleanup()
+```
+
+同じ run ではその後再接続・再生成できたが、これは「安全に restart できる」証明ではない。
+
+最初に試すべき最小修正は **requester が prompt 待ちのとき `pending_prompt` へ空文字を返し、C++ の chat loop を自然終了させてから新 Module を作る graceful stop**。`main.cpp` は prompt length 0 で loop を抜け `llama_free` / `llama_model_free` を通る。
+
+これを同一PCで実測してから generation 再編成へ使う。
+
+Peer server は generation ごとに再起動しない。Web 側 `PeerManager` の接続を貼り替えながら同じ RPC backend を待機させる方向を優先する。
+
+## model source
+
+### local `File`
+
+物理2PC Runtime PoC で成功済み。requester だけが File を持てばよく、peer は GGUF を事前保持しない。
+
+### HTTP URL
+
+既存 llmlet の URL 経路を使う場合:
+
+- **HEAD + `Content-Length` は必須**
+- `Range: bytes=...` に対する **206 は強く推奨**
+- 206 非対応なら全体を IndexedDB へ先読みする fallback に入る
+
+Web repo の `/models/*` を使う場合、この条件は実測してから UI の既定経路にする。
 
 ## ホストページ要件
 
-Runtime を読み込むページが満たすべき条件。
+| 要件 | 合格条件 |
+|---|---|
+| secure context | `window.isSecureContext === true` |
+| COOP / COEP | `crossOriginIsolated === true` |
+| SharedArrayBuffer | `typeof SharedArrayBuffer === 'function'` |
+| WebGPU | `await navigator.gpu.requestAdapter()` が非 null |
 
-| 要件 | 内容 | 合格条件 |
-|---|---|---|
-| COOP / COEP | Emscripten の pthread 利用に必須 | **ヘッダの目視ではなく、ブラウザで `crossOriginIsolated === true` を確認する** |
-| **HEAD + Content-Length** | モデルサイズを `fetch(url, {method:'HEAD'})` の `content-length` から取得している。**ヘッダが無いと `headers.get()` が `null` を返し、`Number(null) === 0` なので `size` が 0 になる**。0 バイトの仮想ファイルができてそのまま壊れる ([CONSTRAINTS.md](CONSTRAINTS.md) F13) | `curl -I <url>` が `Content-Length` を返すこと。**Range より先に踏むエラー** |
-| GGUF 配信の Range (**推奨・必須ではない**) | HTTP URL 経路を使う場合 | `curl -H 'Range: bytes=0-1' -i <url>` が **206** を返すこと。返さなくても動くが、推論開始前に全体を先読みするため起動が遅れ、IndexedDB クォータの影響も受ける ([CONSTRAINTS.md](CONSTRAINTS.md) O2) |
+LAN IP の plain HTTP origin は実測で trustworthy origin にならず、WebGPU / cross-origin isolation を満たせなかった。
 
-## offload の既定値
+物理2PC PoC は各PCの `localhost` で成功した。共有URL / BYOD は別の secure-origin 問題として扱う。
 
-`-ngl` を指定しない場合でも **CPU に落ちるわけではない**。llmlet は `-ngl` 未指定時に `model_params.n_gpu_layers` を触らず、`llama_model_default_params()` の既定 `-1` が残る。フォークの `llama-model.cpp` はこれを `params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer + 1` と解決するため、**既定は全 layer offload** ([CONSTRAINTS.md](CONSTRAINTS.md) F19)。
+## ICE / mDNS の既知問題
 
-層数を意図的に絞りたいときだけ `-ngl` を明示する。
+物理2PC PoC では、Chrome の通常設定で host candidate が `.local` に匿名化された際、PC-B が PC-A の mDNS candidate を解決できず candidate pair が作られなかった。
 
-## モデル・演算子の前提
+Chrome の mDNS anonymization を診断用に無効化すると raw LAN IP の host pair が `selected / succeeded` になり、RPC 推論まで完走した。
 
-Runtime が実行できるモデルは、**ピア側バックエンドが実際に実行できる演算**に制約される。しかも RPC デバイスは「何でも実行できる」と申告するため、クライアントからはそれが見えない ([CONSTRAINTS.md](CONSTRAINTS.md) の「根本原因」節)。
+したがって `iceServers: []` の Hono signaling 統合テストは、**現在の2台では同じ診断設定を使えば進められるが、それを BYOD の完成条件にしてはいけない**。
 
-現時点で分かっている具体例は2つ。`ggml-webgpu` に `MUL_MAT_ID` が無いため **MoE モデルは WebGPU ピアで動かない** (F14)。また **単一テンソルが `maxStorageBufferBindingSize` を超えるモデル**も `supports_op` で弾かれる (F12)。どちらもピア側に CPU フォールバックが無いため行き止まりになる (F16)。
-
-Web 側にモデルを選ばせる API を作る場合、この制約を Runtime 側で検査して明示的にエラーを返すこと。黙って落ちるのが最悪。
-
-## DataChannel 引き渡し規約
-
-- `binaryType = 'arraybuffer'` を設定してから渡す
-- `open` 状態になってから渡す
-- **close 責任の所在は未確定** (P0-4)。現状どちらが閉じるか決まっていない
-- **想定外のピアからの DataChannel は受け入れない。** `ggml-rpc` は相手から来たテンソル記述子をデシリアライズして自プロセスのメモリを操作するため、「LAN だから安全」では解消しない ([CONSTRAINTS.md](CONSTRAINTS.md) セキュリティ節)
+詳細は [STAGE3_RESULT_2026-08-25.md](STAGE3_RESULT_2026-08-25.md)。
 
 ## 責務境界
 
-| 領域 | Runtime | Web | 未割当 |
-|---|---|---|---|
-| WASM llama.cpp のビルド | ✅ | | |
-| RPC の WebRTC 対応パッチ | ✅ | | |
-| WebGPU バックエンド有効化 | ✅ | | |
-| DataChannel 上の RPC バイト列 | ✅ | | |
-| WebSocket 制御プレーン | | ✅ | |
-| SDP / ICE 交換 | | ✅ | |
-| RTCPeerConnection の生成・維持 | | ✅ | |
-| GGUF の HTTP 配信 | | ✅ | |
-| **prompt の投入経路** | | | ⬜ P0-1 |
-| **model source の指定** | | | ⬜ P0-2 |
-| **DataChannel の close 責任** | | | ⬜ P0-4 |
-| **generation 切替時の再初期化** | | | ⬜ P0-4 |
+| 領域 | Runtime | Web |
+|---|---|---|
+| WASM llama.cpp build | ✅ | |
+| patched llama.cpp RPC | ✅ | |
+| WebGPU backend | ✅ | |
+| model virtual file / ChunkCache glue | ✅ | |
+| prompt / stdout / Runtime lifecycle glue | ✅ | |
+| Hono WebSocket | | ✅ |
+| SDP / ICE signaling | | ✅ |
+| RTCPeerConnection / DataChannel | | ✅ |
+| DataChannel 上の `PeerManager` framing / backpressure | | ✅ |
+| roster / generation UI state | | ✅ |
+| GGUF HTTP serving | | ✅ |
 
-「未割当」を空欄にせず明示する。ここが統合時の事故ポイントになる。
+## 次の executable step
 
-## llmlet 側の接合点
+1. Runtime repo に PeerJS 非依存の adapter を実装する
+2. reference build の `llmlet-mod.js` / `.wasm` と adapter を Web repo の `/wasm/` へ置く
+3. Web repo の `rpc.manager` を adapter に注入する
+4. **同一PC**で Hono signaling → real PeerManager → real WASM → token text 生成を通す
+5. 同じものを物理2PCで再実証する
 
-PeerJS を自前シグナリングへ差し替える際に触ることになる境界 (llmlet `libllmlet.js` で確認):
-
-```text
-Module.PeerManager.{ connect, accept, send, recv, register_buf, close_connection }
-```
-
-`release_conn` は接合点ではない。実体は `$release_conn: function(ptr) { _free(ptr); }` で、単なるバッファ解放。
+この段階では大モデル・BYOD・UI演出を同時に触らない。まず「Web repo の現在の接続層に real WASM を差したら実際に1 prompt 通るか」だけを答える。

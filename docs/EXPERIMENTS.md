@@ -186,18 +186,84 @@ GGUF は **PC-A にだけあればよい**。RPC は必要なテンソルをピ�
 
 ### 用意するもの
 
-両PCとも**同じ1本のコマンド**でバンドルを作る。`--peerserver` に **PC-A の LAN IP** を渡せば、`iceServers: []` の注入 (F23 対策) と `peerserverAddress` の書き換えが同時に済む。
+**PC-A で1回だけ clean build し、その成果物を PC-B へ丸ごとコピーする。PC-B では再生成しない。** こうすると「2台の runtime bytes が本当に同じか」という問いが消える。
 
-```bash
-python scripts/make-lan-bundle.py <out> --peerserver 192.168.0.26:9000 --probe
-python scripts/serve-runtime.py <out> --port 8888     # 各PCが自機の loopback を開く
+段階ごとに**別のバンドル**を作る。ネットワークを変えると PC-A の IP が変わるので、古いバンドルを使う事故を防ぐ。
+
+| 段階 | 出力 | `--peerserver` |
+|---|---|---|
+| A (同一PC 3タブ) | `build/stageA-local` | `127.0.0.1:9000` |
+| B (物理2PC) | `build/stage3-lan` | **自前ルータに繋いで確定した** PC-A の IP |
+
+段階B のバンドルは、**PC-A の新しい LAN IP が確定してから**作る。
+
+```powershell
+# 出力ディレクトリは再利用される構造なので、必ず消してから作る。
+# 実際に、手編集された index.html が残ったまま「再生成成功」になった事故がある。
+Remove-Item .\build\stage3-lan -Recurse -Force -ErrorAction SilentlyContinue
+python scripts\make-lan-bundle.py build\stage3-lan --peerserver <確定したPC-A-IP>:9000 --probe
+
+# 安全柵: STUN を手編集した経緯があるので毎回見る。0件であること。
+Select-String .\build\stage3-lan\index.html -Pattern "stun:|turn:"
+
+# manifest を保存し、PC-B へコピーした後に同じ値になることを確認する
+Get-ChildItem .\build\stage3-lan -File | Get-FileHash -Algorithm SHA256
 ```
 
-PeerServer は **PC-A だけ**で起動する。
+各PCで自機の loopback を開く。**PeerServer は PC-A だけ**で起動する。
 
 ```bash
-npm --prefix tools/peerserver run start
+python scripts/serve-runtime.py <out> --port 8888
+npm --prefix tools/peerserver run start      # PC-A のみ
 ```
+
+### 試行記録 (2026-08-25) — ネットワークが前提を満たさず無効
+
+**通ったところ**: PeerServer signaling / 両筐体で WebGPU + RPC server 起動 / PC-B への incoming PeerJS connection (`received connection: <Requester ID>`)。
+**止まったところ**: PC-A → PC-B の DataChannel が `connecting → failed`。`iceServers: []` でも Google STUN 追加でも同じ。
+
+**この試行は O4 の検証になっていない。** 2台が別 IPv4 subnet にあり、PC-A から PC-B への直接経路が存在しなかった。
+
+| 計測 (PC-A 上) | 結果 |
+|---|---|
+| PC-A | `192.168.0.26/24`、GW `192.168.0.1` |
+| PC-A の routing table | **`192.168.1.0/24` へのエントリなし** |
+| PC-A → PC-B (`192.168.1.106`) ping | 到達不能 |
+| PC-A → PC-B tracert | `192.168.0.1 → 218.40.227.155 → 218.40.226.77 → 61.203.192.249` — **default route で ISP へ抜けて消える** |
+| PC-A の Ethernet ネットワーク分類 | Public |
+| PC-A の Chrome inbound firewall 規則 | mDNS (UDP) の1件のみ |
+
+B→A:9000 の TCP が通ったのは**片方向**で、**A→B 方向は一度も確認していなかった**。
+
+**確定**: D1/D2 を維持し relay を使わない条件で、PC-A → PC-B の直接経路が無かった。
+**未確定 (仮説のまま)**: PC-B が別ルータ / NAT 配下にいるか / 両者の srflx が同一 public IP になり hairpin が要るか / mDNS 難読化が実際に経路を隠していたか。**candidate と candidate-pair を記録していなかったので、どれも測れていない。** これを測れるようにしたのが `scripts/lan-probe.js` の ICE 診断。
+
+同じ試行中に `/restart` の WebGPU cleanup crash も観測した。**DataChannel 失敗とは別事象** (`CONSTRAINTS.md` O9)。
+
+### まずネットワークが段3の前提を満たすか確かめる
+
+上の失敗はここを見ていれば試行前に分かった。**モデルもブラウザも要らない。**
+
+1. **両PCで `ipconfig` を実行し、IPv4 アドレスと subnet mask / prefix を記録する。**
+   **同一 IPv4 subnet にいること**を確認する。`/24` である必要はない — `/23` でも `10.x` でも `172.16.x` でもよく、必要なのは「実際の prefix 上で同じ subnet」または「双方向に直接 routing 可能」なこと。
+2. **`tracert <相手のIP>` を両方向で実行する。**
+   **ISP のアドレスへ抜けたら、その時点で中止する。** private address が default route へ流れているということで、LAN として繋がっていない。これが 2026-08-25 の決定的な指標だった。
+3. **ping を両方向で見る。**
+   ⚠️ **routing の sanity check であって合否ではない。** Windows Firewall が ICMP だけ落とす構成があるので、**ping 失敗単独では WebRTC 不合格としない**。逆に ping が通っても UDP が通る保証はない。
+4. **両PCで当該ネットワークの分類を Private にする。**
+   Public プロファイルは inbound を強く絞る。`Get-NetConnectionProfile` で確認する。
+5. **VPN と仮想 NIC を停止し、NIC を棚卸しする (F30)。**
+   `candidateTypes: ["host"]` は「STUN/TURN を使っていない」証拠にはなるが、**経路が意図した LAN NIC だった証明にはならない** —
+   VPN・仮想・複数物理 NIC もすべて host candidate を出し、mDNS 難読化のせいで candidate アドレスからは NIC を判別できない。
+   **可能なら意図した物理 NIC を各PC 1本だけ有効化する。** PC-A には Tailscale アダプタが存在するので特に注意。
+
+   ```powershell
+   Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object Name, InterfaceDescription, LinkSpeed
+   Get-NetIPAddress -AddressFamily IPv4 | Select-Object IPAddress, InterfaceAlias, PrefixLength
+   Get-NetRoute -AddressFamily IPv4 | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' }
+   ```
+
+   この一覧を **selected candidate pair と併せて**記録する。
 
 ### まず Firewall を潰す (段2.7 で証明できなかった部分)
 
@@ -211,7 +277,10 @@ Test-NetConnection 192.168.0.26 -Port 9000
 
 ### 開始前チェックリスト
 
-**0. 段3 では ping ボタンを使わない (F27)。3タブすべて手入力する。**
+**0-a. 段3 では `/restart` を使わない (O9)。**
+`/restart` は WebGPU cleanup で落ちる可能性がある。物理2PC が `connected` → RPC0/RPC1 → layer 配置まで来たところで踏むと、**O4 の実験と O9 の再現が混ざって両方とも読めなくなる**。O9 の確認は**段階A (同一PC) で単独に**行う。段3 で復帰が必要なときは reload → Peer ID 再入力。
+
+**0-b. 段3 では ping ボタンを使わない (F27)。3タブすべて手入力する。**
 ping は `BroadcastChannel('webrtc')` なので **PC-A 内の2タブにだけ届く**。押すと requester の `otherpeers` に server A だけが追記され、後から server B を足すと重複や順序の汚染が起きる。**その順序が RPC0 / RPC1 を決める**ので静かに事故る。
 
 1. **古い Runtime タブを全部閉じる** — 前回 `777b5c45` / `ff4f075b` / `e8f025bb` の3枚が残っていた
@@ -269,8 +338,17 @@ ping は `BroadcastChannel('webrtc')` なので **PC-A 内の2タブにだけ届
    `navigator.gpu` の存在だけでは adapter が取れる保証にならない。**PC-B の adapter と limits はここで採る** (PC-A は `maxStorageBufferBindingSize = 2147483644` / `maxBufferSize = 2147483648` / `nvidia turing`)
 8. **Peer ID → 物理PC 表を埋める** (下記)
 9. **`otherpeers` を役割ごとに手入力する** (下記)
+
+   ⚠️ **リロードすると Peer ID が変わる。** 2026-08-25 はこれで `rejecting connection from unexpected peer:` を踏んだ。**どれか1枚でもリロードしたら、そのタブの新しい ID を関係する全タブの `otherpeers` に入れ直す。** これは F27 (ping ボタン) とは別の事故なので、ping を使わなくても起きる。
 10. **requester から生成**
 11. **ログを突き合わせる** (下記「合格条件」)
+12. **3タブそれぞれで ICE 診断を回収する**
+
+    ```js
+    copy(JSON.stringify(__lanProbe.report(), null, 2))
+    ```
+
+    成否によらず取る。失敗した run こそこれが要る。`report()` は同期なので `await` は要らない。直前の状態変化時点のスナップショットで足りない場合だけ `await __lanProbe.refreshStats()` を使う。
 
 **`otherpeers` の役割表**:
 
@@ -290,11 +368,35 @@ ping は `BroadcastChannel('webrtc')` なので **PC-A 内の2タブにだけ届
 |---|---|
 | Peer ID が取れない | PeerServer / port 9000 |
 | Peer ID は取れるが DataConnection が開かない | ICE / Windows Firewall / AP isolation |
-| `rejecting connection from unexpected peer:` | `otherpeers` の入力ミス (F27) |
+| `rejecting connection from unexpected peer:` | `otherpeers` の入力ミス — **リロード後の Peer ID 更新漏れ**、または F27 の ping による汚染 |
 | **DataConnection は開くが `using device RPC0 ...` が出ない** | **llmlet PeerManager / RPC handshake / server 側 Runtime** |
 | RPC0 / RPC1 は出るがモデルロード・生成で死ぬ | WebGPU / メモリ / model placement |
 
 **ネットワーク側か Runtime 側かを最初の1分で分ける**のが狙い。
+
+#### DataConnection が開かないときは診断を読む
+
+`__lanProbe.report()` の `connections[]` を、**失敗した接続の `peerId`** で引く。
+
+| 診断で見えるもの | 読み方 |
+|---|---|
+| `candidates[]` が空 | gathering が始まっていない。ICE 以前 — signaling / SDP を疑う |
+| `candidates[].isMdns` が true で、`stats.pairs` が全部 `failed` / `succeeded` が1つも無い | **mDNS 名を相手が解決できていない。** 同一 subnet に居ないか、マルチキャストが遮断されている |
+| `remoteCandidates[]` が空 | 相手の candidate が届いていない。**片側の gathering か signaling の問題**であって自分の ICE ではない |
+| `remoteCandidates[].isMdns` が true | **相手も難読化している。** 両側とも `.local` なら host 経路は subnet を跨げない |
+| `candidateTypes` に `srflx` / `relay` が出る | **D1/D2 違反。** `iceServers: []` が効いていない (`iceConfigs` を確認する) |
+| `candidateErrors[]` に `errorCode` がある | STUN/TURN へ出ようとして失敗している。LAN-only 構成なら**そもそも出ているのが異常** |
+| `stats.selected` が null で `pairsEverObserved` に `succeeded` も無い | 疎通経路ゼロ。下の切り分け順へ |
+| `stats.selected.local.addressSource` が `"signaled"` | stats が住所を伏せたので signaled candidate から取った値 (F29)。`matchedOn` が照合の強さ。⚠️ **これは signaling に載ったアドレスであって実 IP ではない** — `.local` なら `.local` のまま |
+| `addressSource` が `"ambiguous-signaled"` | 候補が複数一致したので**採用していない**。`candidateMatches` に件数。**推測値を読まないこと** |
+| `statsSnapshots` の `error` | その時点の `getStats()` が失敗した (接続破棄など)。診断の欠落であって疎通の失敗ではない |
+
+**切り分け順** (成果物には入れない、手順のみ):
+
+1. `isMdns` が true で pair が1つも `succeeded` にならない → **mDNS**。両PCの Chrome を `--disable-features=WebRtcHideLocalIpsWithMdns --user-data-dir=<temp>` で起動して再試験 (F28)
+2. 素の IP candidate が出ているのに pair が成立しない → **firewall**。Chrome の inbound UDP を許可する
+3. どちらでも駄目 → **AP isolation**。有線スイッチで切り分ける
+4. ここまでで駄目なら初めて TURN を検討する。**D7 の変更提案になるので、勝手に採らずユーザー判断を仰ぐ**
 
 ### どのピアがどの物理PCかを記録する
 
@@ -319,6 +421,25 @@ RPC device の index は `otherpeers` 欄の記入順で決まる (`llmlet.js:84
 上の表を埋めたうえで、1と2のログを両方残す。「RPC0 に layers 0-14」だけでは、**RPC0 がどの物理筐体だったかが後から辿れない**。
 
 あわせて O4 (mDNS / AP isolation) と転送スループットもここで測る。O4 はモデル不要で検証でき、失敗すると全段が止まる。
+
+**O4 を「解決した」と書くには、token が出たことに加えて ICE 側の証拠が要る** (`__lanProbe.report()` を3タブ分残す)。
+
+| 見るもの | 合格 |
+|---|---|
+| `connectionState` | 物理PC間の接続が `connected` に到達 |
+| `stats.selected` | **selected candidate pair を特定できる** — `selectedVia` が `transport.selectedCandidatePairId`、取れなければ fallback の `nominated+succeeded` |
+| `candidateTypes` | `host` のみ。`srflx` / `relay` が出たら **D1/D2 違反**なので不合格 |
+| `connectionsWithoutPeerId` | `0`。どの `RTCPeerConnection` がどのピア宛てか対応が取れていること |
+| `externalResourceCount` | `0` |
+| `mdnsLocalCandidateCount` / `mdnsRemoteCandidateCount` | **0 である必要はない。** `.local` のまま繋がったなら「mDNS がこのネットワークで解決できた」という積極的な結果で、O4 に対する答えとしてはむしろ強い |
+| `ambiguousAddressCount` | 出たらその pair の住所は**採用しない**。診断が「一意に決められなかった」と言っている状態で、推測値ではない |
+| `pairsEverObserved` | 失敗時に、**各 snapshot で観測できた pair の履歴**が残っていること |
+| NIC 棚卸し | VPN / 仮想アダプタが落ちており、意図した物理 NIC の一覧が記録されていること (F30) |
+| バンドル | PC-A / PC-B の全ファイルが**同一 SHA256** であること |
+
+⚠️ `.local` が出ること自体は失敗ではない。**Chrome は loopback 同士でも難読化する** (F28)。判定するのは pair が成立したかどうか。
+
+⚠️ **`pairsEverObserved` は「試された pair 全部」ではない。** ポーリングしていないので、状態遷移の合間に生成されて消えた pair は観測されない。**取得できた snapshot のいずれかで観測された pair の和集合**であって、それ以上ではない。
 
 ## 段6 — 共有URL / BYOD 用の trusted secure origin (製品統合問題)
 

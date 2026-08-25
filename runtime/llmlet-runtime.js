@@ -17,6 +17,10 @@ function deferred() {
     resolve = res;
     reject = rej;
   });
+  // Runtime errors can happen before a consumer awaits ready/stop. Attach a handler
+  // immediately so the browser does not report a misleading unhandledrejection; the
+  // original promise still rejects normally for explicit awaiters.
+  void promise.catch(() => {});
   return { promise, resolve, reject, settled: false };
 }
 
@@ -106,23 +110,28 @@ async function openChunkCache() {
     storeName,
     async put(key, chunk) {
       const tx = db.transaction(storeName, "readwrite");
+      const txDone = transactionDone(tx);
       const store = tx.objectStore(storeName);
       const reqDone = new Promise((resolve, reject) => {
         const req = store.put(chunk, key);
         req.onsuccess = () => resolve();
         req.onerror = () => reject(req.error ?? new Error("ChunkCache put failed"));
       });
-      await Promise.all([reqDone, transactionDone(tx)]);
+      await Promise.all([reqDone, txDone]);
     },
     async get(key) {
       const tx = db.transaction(storeName, "readonly");
+      // Register completion handlers before waiting for the request. A readonly
+      // transaction is allowed to complete immediately after its request succeeds;
+      // attaching oncomplete afterwards can miss the event and hang forever.
+      const txDone = transactionDone(tx);
       const store = tx.objectStore(storeName);
-      const value = await new Promise((resolve, reject) => {
+      const reqDone = new Promise((resolve, reject) => {
         const req = store.get(key);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error ?? new Error("ChunkCache get failed"));
       });
-      await transactionDone(tx);
+      const [value] = await Promise.all([reqDone, txDone]);
       return value;
     },
     close() {

@@ -11,92 +11,190 @@
 | 文書 | 内容 |
 |---|---|
 | [DECISIONS.md](DECISIONS.md) | チームで確定した決定事項。製品判断と技術的事実を区別して記録 |
-| [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) | Runtime が Web アプリ側に提供する境界と API。**P0 未解決あり** |
-| [CONSTRAINTS.md](CONSTRAINTS.md) | 技術制約を「検証済み / 仮説 / 未解決」で分類。**技術的事実の正本はここ** — 他文書の説明が食い違ったらこちらを優先する |
-| [EXPERIMENTS.md](EXPERIMENTS.md) | モデルサイズの梯子と実験計画 |
+| [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) | Runtime と Web repo の現在の接合点。**次の実装の正本** |
+| [CONSTRAINTS.md](CONSTRAINTS.md) | 技術制約を「検証済み / 仮説 / 未解決」で分類。技術的事実の詳細 |
+| [EXPERIMENTS.md](EXPERIMENTS.md) | モデルサイズの梯子と過去の実験計画・失敗記録 |
+| [STAGE3_RESULT_2026-08-25.md](STAGE3_RESULT_2026-08-25.md) | **最新の物理2PC実験結果**。Stage 3 の現行ステータスはこちらを優先 |
 | [handoff/web-repo-corrections.md](handoff/web-repo-corrections.md) | Web アプリ側リポジトリへの指摘 |
 
 ## このリポジトリについて
 
-`dip_Distributed_LLM_Runtime` は、複数のブラウザ上の計算資源を利用して `llama.cpp` による分散LLM推論を試すための Runtime 側リポジトリです。
+`dip_Distributed_LLM_Runtime` は、複数のブラウザ上の計算資源を利用して `llama.cpp` による分散LLM推論を動かす Runtime 側リポジトリです。
 
 Webアプリ本体（React / Hono / UI / Room管理など）は、別リポジトリ `RiTa-23/dip_Distributed_LLM` で開発しています。
 
-このリポジトリでは主にRuntimeとそのbuild artifactを作り、Webアプリ側から利用する形を想定しています。npm packageなどの具体的な配布形式はまだ決めていません。
+このリポジトリの責務は主に:
 
-## 現在目指している体験
+- pin 済み llmlet / llama.cpp の再現ビルド
+- WASM / WebGPU / llama.cpp RPC
+- browser-side Runtime glue
+- model / prompt / Runtime lifecycle
+- Web repo が消費できる Runtime build artifact
+- Runtime を単独検証するための harness
+
+です。
+
+## 目指している体験
 
 - ユーザーがブラウザから参加できる
 - 複数PCの計算資源を利用する
 - 1台では扱いにくい、より大きなLLMを複数PCで動かす
 - Requesterが推論を開始し、Peerが計算資源を提供する
 
-「PCが増えるほど必ず高速になる」ことは主目的ではありません。むしろ llmlet は並列化未対応で各ピアが逐次評価するため、ピアを増やしても速くはなりません (`CONSTRAINTS.md` F8)。**複数PCのメモリを利用して、1台に載らないモデルを動かせること**を重視しています。
+「PCが増えるほど必ず高速になる」ことは主目的ではありません。pin 済み llmlet / llama.cpp RPC の現在の構成は各ピアをまたぐ通信・評価コストがあり、ピア追加 = 高速化とは言えません。
 
-## 現在のアーキテクチャ仮説
+**プロダクトの本命証明は「1台に載らない dense model を複数PCなら動かせる」こと。** 物理2PCで小モデルを分散できたことは大きな前進ですが、この最終証明とは分けて扱います。
+
+## 2026-08-25 現在の到達点
+
+### Runtime reference path
+
+達成済み:
+
+- pin 済み llmlet reference build 再現
+- 1タブで local WebGPU inference
+- 同一PC 3タブで requester + RPC peer 2つへ layer 分割
+- LAN-only bundle (`iceServers: []`, local PeerJS/Bootstrap, runtime external HTTP 0)
+- **物理2PCで requester + PC-A peer + PC-B peer の分散推論を完走**
+
+物理2PCの成功 run では PC-A `192.168.1.107` と PC-B `192.168.1.106` の raw host candidate が UDP で `selected / succeeded` になり、PC-B peer を使ったRPC通信の後に実際のモデル回答まで生成されました。
+
+詳細: [STAGE3_RESULT_2026-08-25.md](STAGE3_RESULT_2026-08-25.md)
+
+### Web repo
+
+Web repo `develop` 側にはすでに:
+
+- Hono WebSocket の roster / generation / signaling
+- requester ↔ peer の RTCPeerConnection / DataChannel
+- llmlet の `Module.PeerManager` 契約を DataChannel 上に実装する `apps/web/src/webrtc/peerManager.ts`
+- React の requester / peer UI
+
+があります。
+
+したがって Runtime 側で **PeerJS の代替 signaling をもう1つ作る必要はない**。
+
+現在の不足は、Web repo のその接続層へ **real `llmlet-mod.js` / `.wasm` と model / prompt / cache / lifecycle glue を差すこと**。
+
+接合点の正本は [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md)。
+
+## 現在のアーキテクチャ
 
 ```text
-Requester Browser
-  ├─ llama.cpp client / orchestrator
-  ├─ local WebGPU（利用方法は要検証）
-  └─ WebRTC DataChannel
-       ├─ Peer A → llama.cpp RPC server / WebGPU
-       ├─ Peer B → llama.cpp RPC server / WebGPU
-       └─ Peer C → llama.cpp RPC server / WebGPU
+Requester browser (Web repo)
+  ├─ React UI
+  ├─ Hono signaling client
+  ├─ RTCPeerConnection
+  ├─ Web PeerManager (DataChannel framing)
+  └─ Runtime adapter
+       ├─ Module.PeerManager = Web PeerManager
+       ├─ ChunkCache / model virtual file
+       ├─ prompt queue / text stream
+       └─ llmlet-mod.js / wasm
+            └─ patched llama.cpp RPC client
+                 ├─ RPC peer A
+                 └─ RPC peer B
 
-Hono（別リポジトリ）
-  ├─ Room / Peer管理
-  ├─ WebRTC signaling
-  ├─ 状態管理・UIへの通知
-  └─ モデル配信（GGUF。必須は HEAD + Content-Length、206 Range は推奨 → CONSTRAINTS.md F13 / O2）
+Peer browser (Web repo)
+  ├─ RTCPeerConnection
+  ├─ Web PeerManager
+  └─ Runtime adapter
+       └─ llmlet-mod.js / wasm
+            └─ patched llama.cpp RPC backend / WebGPU
+
+Hono
+  ├─ Room / roster / generation
+  ├─ WebRTC signaling relay
+  ├─ static Web/WASM/model serving
+  └─ 重い RPC data は中継しない
 ```
 
-重いRPCデータはHonoで中継せず、RequesterとPeer間のWebRTC DataChannelで扱います (`DECISIONS.md` D5)。
+制御プレーン = Hono WebSocket、データプレーン = requester ↔ peer の WebRTC DataChannel という分離は維持します。
 
-この構成は現時点の仮説であり、実測結果によって変更する可能性があります。
+## 今いちばん重要な未解決
 
-## 最大のリスク
+### P0-A — real WASM と Web repo の縦切り統合
 
-`CONSTRAINTS.md` の **O0** と **O4** が現時点の中核リスクです。
+PeerJS reference path では動いたが、Web repo の custom `PeerManager` と real WASM を一緒に動かした実測はまだありません。
 
-- **O0 (モデル選定に直結)**: **ピアが実行できない演算が、実行できないまま送られてくる**という構造的な穴があります。RPC デバイスは「何でも実行できる」と申告する (F15) 一方、ピア側には CPU 退避が無い (F16) ためです。具体例は2つ — WebGPU に `MUL_MAT_ID` が無いため **MoE は動かない** (F14)、および **単一テンソルが `maxStorageBufferBindingSize` を超えるモデル**も弾かれる (F12)。`DECISIONS.md` D8 の Qwen3.6-35B-A3B は MoE です。**デモは dense モデルで組む必要があります**
-- **O4 (接続性)**: `iceServers: []` でも同一 LAN なら繋がるという想定ですが、Chrome は host candidate を `.local` (mDNS) へ難読化するため、mDNS 解決が失敗する環境では疎通しません。AP isolation も同様。モデル不要・ブラウザ2台で検証でき、失敗すると全段が止まります
+次の成功条件は **同一PCで Hono signaling → Web PeerManager → real WASM RPC → real model generation が1 prompt完走すること**。
 
-当初こちらが中核リスクと考えていた「requester が**モデル全体**をメモリに保持するのでは」という懸念は、実コードを読んで否定されました。`addRemoteFile()` がチャンク単位のストリーミングをしており (F3/F4)、RPC ピアが1台でもいれば requester のローカルデバイスは配置対象に入りません (F17)。
+これを通すまで UI polish / 大モデル / BYOD 問題を同時に触らない。
 
-**ただし requester のヒープ消費がモデル非依存になるわけではありません。** 入力層は常に CPU に固定されるため `token_embd.weight` は必ず requester 側に載ります (F21)。この下限は語彙サイズに比例するので、O1 は P1 として残っています。
+### P0-B — lifecycle / generation 切替 (O9)
 
-いずれも `EXPERIMENTS.md` の段0.5 と段3 で確認します。
+Requester の RPC peer list は process 起動時の `-rpc` 引数で固定されるため、generation の顔ぶれが変わると requester Runtime の再起動が必要です。
 
-## Runtime側で扱う領域
+既存 llmlet `/restart` の force-exit path では WebGPU cleanup 中の `RuntimeError: unreachable` を再現しました。同じ run ではその後再接続・再生成できましたが、robust restart の証明ではありません。
 
-`llama.cpp` のWASMビルド / WebGPU backend / `llama.cpp RPC` のブラウザ利用 / Requester・Peer Runtime / WebRTC DataChannelとRPC transportの接続 / モデルロード / 推論・token生成 / Runtime内部の状態やエラーを外部へ伝える仕組み。
+最小仮説は、prompt 待ち中に空文字を返して `main.cpp` の chat loop を自然終了させる graceful stop。adapter 実装後に同一PCで実測します。
 
-React UI・RoomのUX・Honoのロスター管理・WebSocket APIはWebアプリ側で扱います。境界の詳細は `RUNTIME_INTERFACE.md` を参照。
+### P0-C — default Chrome の mDNS host candidate
 
-## 既存技術との関係
+物理2PCでは Chrome の通常設定で `.local` candidate が使われた際、PC-B が PC-A の mDNS 名を解決できず candidate pair が作られませんでした。
 
-### llama.cpp
+診断用に WebRTC mDNS anonymization を無効化すると raw LAN IP pair が即座に接続し、RPC推論まで成功しました。
 
-分散推論の中心となる候補。モデル配置・RPC・デバイス管理は既存機能で扱える範囲を優先します (`DECISIONS.md` D6)。
+これは「host-only WebRTCが動く」証明であって、**BYODの解決ではありません**。Hono統合の今の2台テストは診断設定で進められるが、デモ完成条件にはしない。
 
-### llmlet
+### P1 — 本命モデル / memory pooling
 
-https://github.com/ktock/llmlet — ブラウザ上で WASM + WebGPU + WebRTC + llama.cpp RPC を組み合わせた先行実装で、本プロジェクトの重要な参考資料です。MIT ライセンス (`CONSTRAINTS.md` F10)。
+現状 WebGPU backend は `MUL_MAT_ID` を持たず MoE が動かないため、Qwen3.6-35B-A3B をそのまま本命デモに使えません。
 
-llmletは固定したllama.cpp revisionを利用しているため、現在使いたいモデルや現行upstreamとの互換性は確認が必要です。
+まず dense model で「単一 peer では載らず、複数 peer なら載る」を証明する。
 
-## まだ決めていないこと
+また WebGPU RPC device の `free memory` は実空きではなく `maxBufferSize` を返すため、自動配分は実メモリ比例ではありません。異種端末での OOM リスクは残ります。
 
-- Runtimeの公開API (`RUNTIME_INTERFACE.md` の P0-1〜P0-4)
-- packageとしての配布方式
-- 使用するGGUFと量子化方式
-- Requester自身のWebGPUをどう利用するか
-- Peer増減時の挙動の詳細
-- CPU fallbackをどこまで扱うか
-- llmletの実装をどこまで流用し、どこから変更するか
+## Runtime adapter で忘れてはいけないもの
 
-なお「LAN限定にするか」「STUN/TURN構成」は決定済みです (`DECISIONS.md` D1 / D7)。
+`Module.PeerManager` だけ差せば完成ではありません。pin 済み llmlet の実コード上、adapter には次が必要です。
+
+- `Module.PeerManager`
+- **`Module.ChunkCache`** — RPC cache bridge が直接 `.get/.put` を呼ぶ
+- model File / URL を `/work/model.gguf` に見せる remote-file bridge
+- requester `pending_prompt` / `pending_system_prompt`
+- `isDecodingCancel`
+- stdout TTY streaming / stderr log
+- `onExit` / `onAbort`
+- `locateFile`
+- requester の順序付き `-rpc <peerId>` args
+- peer の `-rpcbackend`
+
+既存 llmlet `startClient` / `startServer` からこの glue を再利用し、`newPeerManager()` だけを注入式へ変えるのが最小変更です。
+
+なお pin 済み Makefile はすでに `release_conn` を `EXPORTED_RUNTIME_METHODS` に含めています。
+
+## 出力 API の注意
+
+C++ は sampled token を `llama_token_to_piece()` → `printf()` していますが、JS 側 TTY hook で見える単位は文字出力です。
+
+そのため Web UI の API 名を `onToken` と断定せず、MVP は `onText(delta)` とします。真の token event が必要になったら C++ callback を追加します。
+
+## モデルについて
+
+デモ既定は dense model。
+
+現時点で小さい reference test に Qwen2.5-0.5B Q4_K_M を使い、単一PC・同一PC複数peer・物理2PCで動作を確認済み。
+
+次の model-size 実験は Web統合を通した後。先に大モデルへ移ると「モデル制約」と「integration bug」が混ざります。
+
+## 共有URL / secure origin
+
+LAN IP の plain HTTP origin は実測で trustworthy origin にならず、`crossOriginIsolated` / SharedArrayBuffer / WebGPU を満たせませんでした。
+
+物理2PC Runtime PoC は各PCの `localhost` を使って成功。
+
+Web repo には開発用 TLS の足場がありますが、飛び入り参加者の端末で証明書警告なしに使える secure origin は別問題です。これは real WASM integration の後に扱います。
+
+## 次にやること
+
+1. [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) の最小 adapter を実装
+2. reference build artifact + adapter を Web repo `/wasm/` へ渡す
+3. 同一PCで **Hono → real PeerManager → real WASM → 1 prompt** を通す
+4. 物理2PCで同じ統合 path を通す
+5. graceful requester restart を検証
+6. dense model で「1台に載らない → 複数台で動く」を証明
+7. mDNS / shared HTTPS / consent を demo gate として解決
 
 ## 関連リポジトリ
 
@@ -107,4 +205,4 @@ llmletは固定したllama.cpp revisionを利用しているため、現在使�
 
 ---
 
-この文書は「完成形」を定義するものではなく、現時点で分かっていること・考えていること・まだ分からないことを共有するためのものです。
+この文書は「完成形」を定義するものではなく、現時点で分かっていること・次に壊すべきリスクを共有するためのものです。

@@ -336,18 +336,25 @@ function startRuntime(nodeId) {
   publishStats();
 }
 
-async function stopRuntime() {
+// The manual stop button only logs a failed stop, because the operator can see it and
+// decide what to do. An auto cycle cannot: a stop that rejects is a failed cycle, so it
+// passes propagate:true. The rethrow has to come after the cleanup below, otherwise a
+// failed stop would leave runtime/transport set and poison the next cycle.
+async function stopRuntime({ propagate = false } = {}) {
   if (!runtime) return;
+  let stopError = null;
   try {
     await runtime.stop();
     logLine("stopped");
   } catch (error) {
+    stopError = error;
     logLine(`stop failed: ${error?.message ?? error}`);
   }
   transport?.close();
   runtime = null;
   transport = null;
   generating = false;
+  if (stopError && propagate) throw stopError;
 }
 
 // ---- manual controls ------------------------------------------------------
@@ -484,7 +491,7 @@ async function runAutoCycle() {
     record.chars = outputBuffer.length;
     if (record.chars === 0) throw new Error("generate produced no output after ready");
 
-    record.stopMs = await timed(() => stopRuntime());
+    record.stopMs = await timed(() => stopRuntime({ propagate: true }));
     const closeStarted = performance.now();
     await waitForRuntimeCloses(before.runtimeCloses + 1, 20000);
     record.closeWaitMs = Math.round(performance.now() - closeStarted);

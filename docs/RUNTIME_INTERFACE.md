@@ -16,7 +16,7 @@
 | 4 | **モデル配信** | HEAD の `Content-Length` は必須。**Range 206 は実質必須** — 非対応だと起動のたびに GGUF 全体を IndexedDB へ先読みする | [model source](#model-source) |
 | 5 | **`releaseBuf` を渡さない** | 受信バッファの所有権は WASM glue にある。free する callback を渡すと double free | [所有権](#受信バッファの所有権--peermanager-は-free-しない) |
 | 6 | **timeout 後は Runtime を作り直す** | `generate()` に watchdog は無い。timeout したら `generate()` を再試行せず `stop()` → 新しい `startRequester()` | [watchdog](#generate-に-watchdog-は無い) |
-| 7 | **既知欠陥 O9** | requester の graceful stop が WebGPU teardown で abort する。**peer は無傷で次の requester は正常に繋がる**が、stop はクリーンではない | [O9](#既知欠陥-o9--graceful-stop-が-webgpu-teardown-で-abort-する) |
+| 7 | **O9 は解消** | requester の graceful stop は `patches/0003` で abort しなくなった。in-app pane と実 Chrome の両方で実測。**stop 中の abort を非致命扱いする実装は書かないこと** | [O9](#o9--graceful-stop-の-abort-は解消済み) |
 | 8 | **確認済みの範囲** | 実 Chrome + WebGPU + 実 GGUF + RPC 推論 + fd 再利用 cleanup まで確認済み。**Web 側の DataChannel / signaling は未確認** | [Gate A](#gate-a-で確認できたこと--できていないこと) |
 
 ### Gate A で確認できたこと / できていないこと
@@ -44,7 +44,7 @@ Runtime-only harness (PeerJS / WebRTC / Hono を使わず、同一 origin 2 タ�
 
 - Web repo の `peerManager.ts` (DataChannel 実装) を差した状態
 - SCTP backpressure / MTU / mDNS / TLS / Hono signaling
-- **実 Chrome での graceful stop** (O9 のため未実行)
+- ~~実 Chrome での graceful stop~~ → **2026-08-26 に実測して PASS** (`patches/0003` 適用後)
 - 長時間 soak、メモリ傾向、複数 peer での layer 分割
 
 ---
@@ -110,6 +110,7 @@ Runtime は **素の llmlet を配らない**。`patches/` に置いた最小 pa
 |---|---|---|
 | `0001-llmlet-close-peer-free-connbuf.patch` | `libllmlet.js` | `close_peer()` が `Module._connbuf[fd]` を free して entry も削除する |
 | `0002-ggml-rpc-close-accepted-fd.patch` | `ggml-rpc.cpp` | RPC server が accept した fd を `close_peer()` で閉じる |
+| `0003-ggml-webgpu-keep-reg-context-on-emscripten.patch` | `ggml-webgpu.cpp` | `__EMSCRIPTEN__` のときだけ WebGPU registry を process/module lifetime にして、browser main thread の static destructor が別 thread 所有の WebGPU handle を `Destroy()` しないようにする (O9)。native build の static lifetime は不変 |
 
 理由は「受信バッファの所有権」節を参照。
 
@@ -252,8 +253,9 @@ export function startPeer(options: PeerRuntimeOptions): PeerRuntime
 
 実装は `runtime/llmlet-runtime.js`。Node 上の lifecycle テスト (`tests/`) は通っているが、
 **real WASM / WebGPU での実ブラウザ実測は Gate A で通した** (接続 → RPC → 実推論 →
-fd 再利用 cleanup)。ただし **Web repo の `PeerManager` を差した状態は未確認**で、
-graceful stop には既知欠陥 O9 が残るため、まだ凍結した API とは扱わない。
+fd 再利用 cleanup)。graceful stop の O9 も `patches/0003` で解消し、in-app pane と
+実 Chrome で再実測済み。ただし **Web repo の `PeerManager` を差した状態は未確認**なので、
+まだ凍結した API とは扱わない。
 
 ### 実装済みシグネチャとの差分
 
@@ -411,61 +413,53 @@ webgpu_buf_pool::cleanup()
 adapter はこれを実装済み (`stop()` → `pending_prompt` で空文字 → `main.cpp` の loop 終了 →
 `onExit(0)`)。`_emscripten_force_exit(0)` への fallback も残してある (既定 5 秒待ってから)。
 
-### 既知欠陥 O9 — graceful stop が WebGPU teardown で abort する
+### O9 — graceful stop の abort は解消済み
 
-**2026-08-26 に実測して原因を特定した。**
+**2026-08-26: 原因を実測で特定し、`patches/0003` で修正して再実測した。**
 
-```text
-WGPUBufferImpl::Destroy()
-  -> _emwgpuBufferDestroy
-    -> WebGPU.getJsObject
-      -> assert(ptr in WebGPU.Internals.jsObjects)   <- 失敗
-        -> abort("Assertion failed") -> ___trap() -> RuntimeError: unreachable
-```
+原因は **cross-thread (context affinity) 違反**だった。emdawnwebgpu の
+`WebGPU.Internals.jsObjects` は Emscripten module instance ごとに存在し、emwgpu 系の
+関数は 1 つも proxy されない。`-sPROXY_TO_PTHREAD` なので WebGPU handle は `main()` を
+走らせる pthread の table に入るが、`exitRuntime()` は pthread では即 return し、
+`___funcs_on_exit()` (= `__cxa_atexit` の static destructor) を **browser main thread でのみ**
+実行する。その thread の table は空なので、`ggml-webgpu` の関数ローカル static が
+持つ WebGPU global context を破棄しようとした時点で
+`assert(ptr in WebGPU.Internals.jsObjects)` が落ちて module ごと abort していた。
 
-`~llama_context` がバッファ解放を完了したログの直後に起きる。**WebGPU buffer handle の
-lifecycle 不整合**であり、
+⚠️ **double-destroy でも earlier-release でもない。** 問題の ptr は全 run・全 context で
+SET 1 回 (pthread 側) と MISS 1 回 (main thread 側) のみで、DEL はどこにも無かった。
+詳細は [CONSTRAINTS.md](CONSTRAINTS.md) F42。
 
-⚠️ **「二重破棄」と断定はできない。** 観測できたのは `WGPUBufferImpl::Destroy()` の時点で
-handle が `WebGPU.Internals.jsObjects` に**存在しない**ことまで。double-destroy が有力仮説だが、
-先に別経路で解放されたのか、そもそも登録されていなかったのかは切り分けていない。
+`patches/0003` は `__EMSCRIPTEN__` のときだけこの registry を process/module lifetime にして、
+静的破棄そのものを起こさせない。GPU オブジェクトの生存期間は module/worker teardown に委ねる。
+native build の static lifetime は変えていない。
 
-そのうえで、
+**実測結果 (patched build、wasm `B87861C9...`)**
 
-- `/restart` 固有ではない。**空 prompt による graceful stop でも起きる**
-- adapter の force-exit fallback が原因ではない。`stopTimeoutMs = 120000` にして
-  fallback が発火しないことを確認したうえで再現した (stop は 49.5 秒で resolve)
+| 測定 | ブラウザ | 結果 |
+|---|---|---|
+| graceful stop | in-app pane | abort 無し、`onError` 未発火、stop 104 ms |
+| peer 無再起動で次 requester | in-app pane | ready → 生成 → clean stop |
+| 5 cycle 連続 | in-app pane | 5/5 `ok`、note 空 |
+| graceful stop + 次 requester | **実 Chrome** | abort 無し、stop 282 ms、2 人目が 299 文字生成 |
 
-**Web 側から見た挙動 (ここが実務上重要)**
+pre-fix バンドル (`A881404F...`) は同じ harness で **4/4 セッションが abort** したので、
+これは直接の A/B になっている。
 
-- `onError` に `requester Runtime aborted: Assertion failed` が来る
-- `stop()` は **resolve する** (hang しない)
-- **peer は無傷**で、そのまま次の requester を受け付ける
-- **次の `startRequester()` は正常に接続・生成できる**
+### Web 側が書いてはいけないもの
 
-したがって **generation 切替は成立するが、stop をクリーンな成功として扱ってはいけない**。
-一方で **stop 中の `onError` を一律に無視するのも誤り**である。
+**`stop()` 中の abort を非致命扱いする分岐を書かないこと。** 以前この文書は
+「O9 シグネチャに一致する cleanup abort なら世代全体の致命的障害として扱わない」条件を
+載せていたが、その abort はもう起きない。条件分岐を残すと、**実際には起きない例外を
+握り潰す実装**になり、本物の障害を隠す。
 
-**非致命扱いにしてよいのは、次の 2 つを両方満たすときだけ。**
+`onError` は素直に障害として扱ってよい。
 
-1. **アプリが明示的に `stop()` を呼んでいる最中**である (自発的な世代交代であって、
-   生成中・ロード中・アイドル中の abort ではない)
-2. **既知 O9 シグネチャと一致する** cleanup abort である —
-   `requester Runtime aborted: Assertion failed` で、かつスタックに
-   `WGPUBufferImpl::Destroy()` / `_emwgpuBufferDestroy` / `WebGPU.getJsObject` を含む
-   (console 側は `RuntimeError: unreachable`)
+⚠️ **未解決 (O9 とは別件)**: 1 つの peer が requester セッションを重ねるほど次の
+`ready` が遅くなる (patched で約 +8 s/cycle)。**pre-fix でも約 +6 s/session あったので
+`patches/0003` 由来ではない。** peer を再起動すると戻る。Runtime 側の蓄積か
+harness ページ側かは未切り分け。詳細は [EXPERIMENTS.md](EXPERIMENTS.md)。
 
-**それ以外の abort は一律で障害として扱うこと。** 生成中・ロード中に来たもの、`stop()` を
-呼んでいないときに来たもの、シグネチャが違うものを stop 中の既知事象と混ぜてはいけない。
-
-⚠️ **条件を満たす場合でもログと観測は必ず残す。** 「無視」ではなく「世代全体の致命的障害
-として扱わない」であって、発生頻度やシグネチャが変わったら upstream の状況が変わった合図になる。
-
-⚠️ **実 Chrome では stop を実行していない**ので、上記は in-app Browser pane の実測に基づく。
-
-`Module.onExit` がそもそも呼ばれるかは生成後の `llmlet-mod.js` で確認済み: `_proc_exit` は
-main thread で `Module["onExit"]?.(code)` を呼び、`callMain` が積んだ keepalive は
-`exitOnMainThread` が pop する。したがって main の return / force exit のどちらでも発火する。
 
 Peer server は generation ごとに再起動しない。Web 側 `PeerManager` の接続を貼り替えながら同じ RPC backend を待機させる方向を優先する。
 
@@ -505,7 +499,8 @@ python scripts/serve-runtime.py build/runtime-harness --port 8888
    `load_tensors: layer N assigned to device RPC0` が出て `ready` が解決する
 3. 日本語 prompt を投げる → `onText` に生成文字が流れ、`generate()` が resolve する
 4. 連続 generate / 生成中 cancel / `stop()` を試し、exit code と
-   `WGPUBufferImpl::Destroy()` 例外の有無 (O9) を記録する
+   `WGPUBufferImpl::Destroy()` 例外の有無 (O9 回帰チェック) を記録する。
+   **`patches/0003` 適用後は 0 件が期待値**
 5. **`patches/0001` の実測**: `fdmax=4` で generate と stop/再接続を繰り返し、
    fd 番号が 0..3 を巡回した後に **「fd usage」表の `registrations` が `connections` に
    追随して増える**ことを確認する。

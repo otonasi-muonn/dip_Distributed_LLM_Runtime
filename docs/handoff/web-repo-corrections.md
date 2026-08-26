@@ -99,41 +99,29 @@ Runtime 側に watchdog はありません。peer が DataChannel を閉じず�
 `stop()` (失敗しても force-exit へ落ちます) を呼んでから、**新しい `startRequester()` を作って**
 次の generation へ移る、が復旧契約です。
 
-### R3b. requester の stop 由来 abort は「既知・復帰可能」として扱ってください (P0)
+### R3b. stop 中の abort を非致命扱いする分岐は **書かないでください** (P0、2026-08-26 更新)
 
-graceful stop (世代交代) のとき、requester の `onError` に
+**この項目は以前と逆の指示になりました。** 過去版はここで
+「`requester Runtime aborted: Assertion failed` が既知 O9 シグネチャと一致したら
+世代全体の致命的障害として扱わない」条件付きの握り潰しを勧めていました。**もう書かないでください。**
 
-```text
-requester Runtime aborted: Assertion failed
-```
+O9 の原因は 2026-08-26 に実測で特定され (cross-thread な WebGPU teardown)、
+`patches/0003` を含む reference build で解消しています。graceful stop は
+in-app pane と実 Chrome の両方で abort 無しに完了し、`onError` は一度も発火しません。
+pre-fix バンドルが同じ harness で 4/4 セッション abort したのに対し、patched は 5/5 cycle が clean でした。
 
-が来ることがあります。**WebGPU backend の teardown 不具合 (O9) で、原因は特定済み**です
-(`WGPUBufferImpl::Destroy()` → `WebGPU.getJsObject` の assert 失敗)。
+したがって:
 
-このとき **`stop()` は resolve し、peer は無傷で、次の `startRequester()` は正常に接続・生成できます**。
-実測で確認済みです。つまり **世代交代自体は成立します**。
+- **`onError` は素直に障害として扱ってください。** stop 中かどうかで分岐しないこと
+- 起きない例外のための握り潰し分岐は、**本物の障害を隠すだけ**です
+- 使う成果物が `patches/0003` を含むことは `BUILD_INFO.txt` の `patch=` 行で確認できます。
+  含まない古いバンドルを使う場合はこの限りではありません
 
-これを一律に致命的エラーとして扱うと **正常な世代交代が失敗に見えます**。かといって
-**stop 中の `onError` をまとめて無視するのも誤りです**。
+もし stop 中に `Assertion failed` を実際に観測したら、それは**握り潰す対象ではなく報告対象**です
+(upstream の状況か、バンドルの取り違えを疑ってください)。
 
-**非致命扱いにしてよいのは、次の 2 つを両方満たすときだけ。**
+詳細: [`RUNTIME_INTERFACE.md` の O9 節](../RUNTIME_INTERFACE.md#o9--graceful-stop-の-abort-は解消済み)
 
-1. **アプリが明示的に `stop()` を呼んでいる最中**である (自発的な世代交代であって、
-   生成中・ロード中・アイドル中の abort ではない)
-2. **既知 O9 シグネチャと一致する** cleanup abort である —
-   `requester Runtime aborted: Assertion failed` で、かつスタックに
-   `WGPUBufferImpl::Destroy()` / `_emwgpuBufferDestroy` / `WebGPU.getJsObject` を含む
-   (console 側は `RuntimeError: unreachable`)
-
-**それ以外の abort は一律で障害として扱うこと。** 生成中・ロード中に来たもの、`stop()` を
-呼んでいないときに来たもの、シグネチャが違うものを stop 中の既知事象と混ぜてはいけない。
-
-⚠️ **条件を満たす場合でもログと観測は必ず残す。** 「無視」ではなく「世代全体の致命的障害
-として扱わない」であって、発生頻度やシグネチャが変わったら upstream の状況が変わった合図になる。
-
-条件を満たした場合は、警告として記録したうえでそのまま新しい Runtime を作ってください。
-
-詳細: [`RUNTIME_INTERFACE.md` の O9 節](../RUNTIME_INTERFACE.md#既知欠陥-o9--graceful-stop-が-webgpu-teardown-で-abort-する)
 
 ### R4. peer の `onError` を UI / roster に繋いでください (P0)
 

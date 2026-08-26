@@ -140,9 +140,12 @@ Runtime-only harness connects a requester and a WebGPU peer, loads a dense GGUF 
 real output, disconnects and reconnects. See the Gate A results in
 [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
-One known defect remains: the requester's graceful stop aborts inside the WebGPU backend teardown
-(`WGPUBufferImpl::Destroy()`), which is the O9 entry in [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md).
-The peer survives it and the next requester connects normally.
+The graceful-stop defect (O9) is fixed. It was a cross-thread teardown: emdawnwebgpu keeps its JS
+handle table per Emscripten module instance, but the C++ static destructors run on the browser main
+thread, whose table is empty. `patches/0003` keeps the WebGPU registry alive for the module's
+lifetime on Emscripten only. Measured clean in the in-app pane and in real Chrome; the pre-fix
+bundle aborted on 4/4 sessions of the same harness. See F42 / F44 in
+[`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md).
 
 1. ~~rebuild the reference artifacts with `patches/` applied~~ — done
 2. ~~pass the Runtime-only harness in a real browser~~ — done (Gate A)

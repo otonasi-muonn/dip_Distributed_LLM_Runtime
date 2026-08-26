@@ -23,7 +23,8 @@ $RuntimeBuildArtifacts = @("llmlet-mod.js", "llmlet-mod.wasm")
 # patches/ cannot silently end up in - or out of - a build.
 $RuntimePatchTargets = @(
     @{ Name = "0001-llmlet-close-peer-free-connbuf.patch"; Repo = "." },
-    @{ Name = "0002-ggml-rpc-close-accepted-fd.patch"; Repo = "llama.cpp" }
+    @{ Name = "0002-ggml-rpc-close-accepted-fd.patch"; Repo = "llama.cpp" },
+    @{ Name = "0003-ggml-webgpu-keep-reg-context-on-emscripten.patch"; Repo = "llama.cpp" }
 )
 
 function Write-RuntimeTextFile {

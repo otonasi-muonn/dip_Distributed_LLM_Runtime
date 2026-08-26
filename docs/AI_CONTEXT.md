@@ -127,13 +127,24 @@ generation が1 prompt完走すること**。
 
 これを通すまで UI polish / 大モデル / BYOD 問題を同時に触らない。
 
-### P0-B — lifecycle / generation 切替 (O9)
+### ~~P0-B — lifecycle / generation 切替 (O9)~~ → 2026-08-26 解決
 
 Requester の RPC peer list は process 起動時の `-rpc` 引数で固定されるため、generation の顔ぶれが変わると requester Runtime の再起動が必要です。
 
-既存 llmlet `/restart` の force-exit path では WebGPU cleanup 中の `RuntimeError: unreachable` を再現しました。同じ run ではその後再接続・再生成できましたが、robust restart の証明ではありません。
+その graceful stop (prompt 待ちに空文字を返して `main.cpp` の chat loop を自然終了させる) が
+WebGPU teardown で abort していたのが O9。**原因は cross-thread teardown で、`patches/0003` で解消しました。**
 
-最小仮説は、prompt 待ち中に空文字を返して `main.cpp` の chat loop を自然終了させる graceful stop。adapter 実装後に同一PCで実測します。
+emdawnwebgpu の JS handle table は Emscripten module instance ごとに存在するのに、
+`___funcs_on_exit()` (C++ static destructor) は browser main thread でだけ走るため、
+handle を作った pthread とは別の thread が `Destroy()` を呼んでいました。詳細は
+[CONSTRAINTS.md](CONSTRAINTS.md) F42 / F44。
+
+in-app pane と実 Chrome の両方で、graceful stop → peer 無再起動で次の requester →
+5 cycle 連続まで abort 無しを実測済み。
+
+⚠️ **別件の未解決**: 1 つの peer が requester セッションを重ねるほど次の `ready` が遅くなります
+(patched で約 +8 s/cycle)。**pre-fix でも約 +6 s/session あったので `patches/0003` 由来ではありません。**
+peer を再起動すると戻ります。Runtime 側の蓄積か harness ページ側かは未切り分け。
 
 ### P0-C — default Chrome の mDNS host candidate
 
@@ -205,7 +216,8 @@ Web repo には開発用 TLS の足場がありますが、飛び入り参加者
    commit / patch / artifact の SHA-256 が入っている
 3. ~~Runtime-only harness を実ブラウザで通す~~
    → **完了 (Gate A)。実 Chrome で実推論・再接続・fd 再利用まで確認**。
-   残課題は graceful stop の WebGPU teardown abort (O9 / F42)
+   残課題だった graceful stop の abort (O9 / F42) も `patches/0003` で解消し、
+   in-app pane と実 Chrome で再実測済み (F44)
 4. reference build artifact + adapter を Web repo の静的配信先へ渡す
    (`scripts/export-web-runtime.ps1` → `build/web-runtime/`)
 5. 同一PCで **Hono → real PeerManager → real WASM → 1 prompt** を通す

@@ -1,0 +1,39 @@
+diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+index 910e9c040..5523f38a4 100644
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -3819,7 +3819,34 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
+         return nullptr;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // Emscripten only: give this registry process/module lifetime instead of static
++    // storage duration. The native build below keeps normal static lifetime.
++    //
++    // emdawnwebgpu keeps its JS handle table inside the Emscripten module instance of
++    // the thread that created each handle, and none of the emwgpu entry points are
++    // proxied to another thread. Under -sPROXY_TO_PTHREAD every WebGPU object created
++    // here therefore lives in the table of the pthread that runs main(). But
++    // exitRuntime() returns early on a pthread and runs ___funcs_on_exit() - the
++    // __cxa_atexit static destructors - on the browser main thread, whose table is
++    // empty. Destroying a wgpu::Buffer from there fails
++    // assert(ptr in WebGPU.Internals.jsObjects) inside getJsObject() and aborts the
++    // whole module.
++    //
++    // Measured on a graceful requester shutdown: the buffer that create_webgpu_device()
++    // allocates for memset_buf_pool had exactly one registration, on the main pthread,
++    // and no release on any thread, yet _emwgpuBufferDestroy() ran for it on the
++    // browser main thread while ___funcs_on_exit() was unwinding the statics.
++    // (dip_Distributed_LLM_Runtime: docs/CONSTRAINTS.md F42 / O9.)
++    //
++    // Never destroying this registry keeps that cross-thread teardown from happening.
++    // The GPU objects it owns are left to the module/worker teardown the browser
++    // performs once the Emscripten instance and its pthread workers go away; this code
++    // makes no claim about when, or whether, that teardown releases them.
++    static ggml_backend_webgpu_reg_context & ctx = *new ggml_backend_webgpu_reg_context();
++#else
+     static ggml_backend_webgpu_reg_context ctx;
++#endif
+     ctx.name         = GGML_WEBGPU_NAME;
+     ctx.device_count = 1;
+ 

@@ -549,13 +549,13 @@ Qwen2.5-0.5B-Instruct Q4_K_M (491,400,032 bytes)、peer は WebGPU (NVIDIA Turin
 | A2 | real WASM requester + peer | **PASS**。環境チェック 6/6、`build: 8645 (c4b18b39d)` が pin と一致、`Starting RPC server v3.6.1` |
 | A3 | RPC への layer 割当 | **PASS**。`load_tensors: layer 0..24 assigned to device RPC0`、`RPC0[peer-1] compute buffer size = 298.50 MiB` |
 | A4 | 実出力 | **PASS**。`ready` 後にリセットしたバッファへ「私の名前は伊藤健太です。」等を生成 (3 セッションとも非空) |
-| A5 | graceful stop | **FAIL**。WebGPU buffer handle の lifecycle 不整合で abort (F42、double-destroy は有力仮説で未確定)。`stop()` は resolve し `onError` も出るが、クリーンではない |
+| A5 | graceful stop | **PASS (2026-08-26 再実測、`patches/0003` 適用後)**。in-app pane / 実 Chrome の両方で abort 無しに完了し `onError` は未発火。stop 所要 pane 71-79 ms / 実 Chrome 282 ms、force-exit fallback 未使用 (`stopTimeoutMs=120000`)。原因は cross-thread teardown (CONSTRAINTS F42)、修正は F44 |
 | A6 | peer 無再起動の 2 回目 | **PASS**。requester を作り直しても peer はそのままで再生成できた |
 | A7 | 安全な fdmax | **PASS**。同時 live fd は常に 1 本と実測できたので `fdmax=4` は安全。1 セッション 175 接続なので 4 で 43-44 周する |
 | A8 | fd 再利用時の cleanup | **PASS (in-app pane)**。stop 後の最終値で accepted=175 / registrations=175 / runtimeCloses=175、lag 0 (F40) |
 | A9 | 実 Chrome + WebGPU | **PASS**。環境チェック 6/6、`navigator.gpu` OK、WebGPU peer 起動、requester から実際の日本語生成成功。fd usage は **accepted=175 / registrations=175 / runtimeCloses=174 / live=1**、fd 0-3 すべて再利用。⚠️ **stop と再接続は実行していない**ので、実 Chrome での 0002 判定は **`runtimeCloses + live == accepted`** (174 + 1 = 175) で満たす |
 
-**判定**: **A5 以外はすべて PASS。**
+**判定 (初回、2026-08-26 午前)**: **A5 以外はすべて PASS。**
 
 A5 は adapter ではなく **WebGPU backend の teardown 不具合** (F42) で、system としては
 復帰できている (peer 無傷・次セッション成功)。
@@ -572,3 +572,68 @@ pane 固有の現象ではない。
 ⚠️ **この harness は BroadcastChannel であり、SCTP backpressure / MTU / mDNS / TLS /
 Hono signaling を一切試験していない。** ここが通っても Web 統合が通る証明にはならない。
 所要時間は F43 のため性能指標にならない。
+
+## 2026-08-26 O9 修正の実測 (patches/0003)
+
+**構成**: patched reference build (llmlet `730bad2f` + llama.cpp fork `c4b18b39` +
+`patches/0001,0002,0003`、wasm `B87861C9...`)、Runtime-only harness、
+Qwen2.5-0.5B-Instruct Q4_K_M を `/model.gguf` から 206 Range 配信、peer は WebGPU (RTX 2080 Ti / Turing)。
+pre-fix 対照は同じ harness を別ポートで、wasm `A881404F...` (0003 なし)。
+
+| # | 測定 | ブラウザ | 結果 |
+|---|---|---|---|
+| M1 | requester graceful stop | in-app pane | **PASS**。`onError` 未発火、console/ログに `Assertion failed` / `unreachable` / `Destroy` 無し、stop 104 ms |
+| M2 | peer 無再起動で次 requester | in-app pane | **PASS**。同じ peer プロセスのまま 2 人目が ready → 生成 123 文字 → clean stop |
+| M3 | 5 cycle (start→generate→stop、cycle ごとに reload) | in-app pane | **PASS**。5/5 が `ok`、note 空、stopMs 71-79 ms |
+| M4 | GPU メモリ (nvidia-smi) | in-app pane | **cycle ごとの明白な増加なし** (下記) |
+| M5 | M1 + M2 | **実 Chrome** | **PASS**。環境 6/6、stop 282 ms、`onError` 未発火、2 人目が 299 文字生成 |
+| M6 | 既存テスト | Node | **36/36 pass** |
+
+**pre/post A/B (同一 harness・同一モデル・同一マシン)**
+
+| バンドル | 結果 |
+|---|---|
+| pre-fix `A881404F...` | **4/4 セッションで `onError fired: requester Runtime aborted: Assertion failed`** |
+| patched `B87861C9...` | **5/5 cycle が `ok`、note 空** |
+
+### M4 — GPU メモリ (粗観測)
+
+peer が常駐する固定分と requester 世代ごとの増分を分けるため、**peer だけ start した状態を baseline** にした。
+
+| ラベル | MiB |
+|---|---|
+| gpu-idle-no-harness | 4312 / 4312 / 4312 / 4406 |
+| **peer-only (M3 の baseline)** | 3939 / 3954 / 3957 |
+| after-cycle-1 | 4592 / 4591 / 4591 |
+| after-cycle-2 | 4586 / 4586 / 4586 |
+| after-cycle-3 | 4591 / 4591 / 4590 |
+| after-cycle-4 | 4567 / 4564 / 4562 |
+| after-cycle-5 | 4751 / 4598 / 4632 |
+| requester-closed-settle | 4606 / 4595 / 4616 |
+| peer-closed-settle | 3874 / 3850 / 3888 |
+
+cycle 1→5 は約 4.56-4.63 GiB で**ほぼ横ばい**。peer-only との差 (約 640 MiB) は requester タブを
+閉じても減らず、**peer タブを閉じて初めて**約 740 MiB 落ちるので、この分は peer 側が保持している。
+
+⚠️ **言えるのは「cycle ごとの明白な増加なし」まで。「leak なし」ではない。**
+nvidia-smi はブラウザ・デスクトップを含むデバイス全体の粗いサンプルであり、絶対値のノイズが大きい
+(タブ 0 枚でも 4.3 GiB 使用中、idle 値自体が 3.9-4.4 GiB の間で揺れる)。
+0003 は GPU オブジェクトの生存期間を module/worker teardown へ意図的に委ねる修正なので、
+この測定は非 leak の証明にならない。
+
+### 副産物: peer のセッション蓄積 (O9 とは別件、未解決)
+
+M3 で `readyMs` が cycle ごとに単調増加した (29.3 → 36.5 → 44.7 → 53.0 → 61.3 s)。
+
+- **peer だけ再起動すると 13.3 s に戻る** (requester は毎 cycle 新しい module + reload なので requester 側ではない)
+- **pre-fix バンドルでも同じ傾き** — 同一 peer に対して warm cache のセッション 2-4 が
+  19.8 → 25.8 → 32.1 s (+6.0, +6.3 s)。**0003 由来ではない**
+- Runtime 側の蓄積か harness ページ側 (peer タブのログ DOM が無制限に伸びる。M3 終了時点で
+  `Client connection closed` が 1225 行) かは**未切り分け**
+
+### 計測時に踏んだ罠
+
+- **8888 に複数の listener が同時に存在し、古い bundle が配られた。** 計測前に listener が
+  1 つであることを確認すること。⚠️ 複数 listener が成立した機構は**未特定**
+- `patches/*.patch` が `core.autocrlf=true` の checkout で CRLF になり、`Get-FileHash` ベースの
+  provenance 検証が落ちた。`.gitattributes` の `/patches/*.patch text eol=lf` で固定した

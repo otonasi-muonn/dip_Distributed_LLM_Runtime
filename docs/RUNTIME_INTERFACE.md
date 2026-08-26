@@ -2,6 +2,48 @@
 
 このリポジトリ (Runtime) が Web アプリ側 (`RiTa-23/dip_Distributed_LLM`) に提供する境界を定義する。
 
+---
+
+## 引き渡しサマリ (2026-08-26)
+
+**Runtime 側は Web 境界より下を実ブラウザで通した。** Web 側はこの節の 8 点だけ押さえれば統合を始められる。
+
+| # | 項目 | 要点 | 詳細 |
+|---|---|---|---|
+| 1 | **成果物** | `build/web-runtime/` の `llmlet-mod.js` / `llmlet-mod.wasm` / `llmlet-runtime.js` を静的配信先へコピー。`BUILD_INFO.txt` / `SHA256SUMS.txt` も同梱される | [reference build](#reference-build--pin-済み-commit--patch) |
+| 2 | **Runtime 起動 API** | `startRequester(options)` / `startPeer(options)`。両方 `ready` / `stop()` を持ち、requester は `generate()` / `cancel()` を持つ | [最小 API](#runtime-adapter-の最小-api) |
+| 3 | **PeerManager 契約** | `connect` / `accept` / `send` / `recv` / `close_connection` / `register_buf` / `close` の 7 メソッド。Web repo の `apps/web/src/webrtc/peerManager.ts` が該当 | [PeerManager](#peermanager) |
+| 4 | **モデル配信** | HEAD の `Content-Length` は必須。**Range 206 は実質必須** — 非対応だと起動のたびに GGUF 全体を IndexedDB へ先読みする | [model source](#model-source) |
+| 5 | **`releaseBuf` を渡さない** | 受信バッファの所有権は WASM glue にある。free する callback を渡すと double free | [所有権](#受信バッファの所有権--peermanager-は-free-しない) |
+| 6 | **timeout 後は Runtime を作り直す** | `generate()` に watchdog は無い。timeout したら `generate()` を再試行せず `stop()` → 新しい `startRequester()` | [watchdog](#generate-に-watchdog-は無い) |
+| 7 | **既知欠陥 O9** | requester の graceful stop が WebGPU teardown で abort する。**peer は無傷で次の requester は正常に繋がる**が、stop はクリーンではない | [O9](#既知欠陥-o9--graceful-stop-が-webgpu-teardown-で-abort-する) |
+| 8 | **確認済みの範囲** | 実 Chrome + WebGPU + 実 GGUF + RPC 推論 + fd 再利用 cleanup まで確認済み。**Web 側の DataChannel / signaling は未確認** | [Gate A](#gate-a-で確認できたこと--できていないこと) |
+
+### Gate A で確認できたこと / できていないこと
+
+Runtime-only harness (PeerJS / WebRTC / Hono を使わず、同一 origin 2 タブ + BroadcastChannel) での実測。
+詳細は [EXPERIMENTS.md](EXPERIMENTS.md)。
+
+**確認済み**
+
+- 実 Chrome で `crossOriginIsolated` / `SharedArrayBuffer` / `navigator.gpu` が揃う
+- WebGPU peer (NVIDIA Turing) が RPC server として起動する
+- requester が Qwen2.5-0.5B-Instruct Q4_K_M を **206 Range 経由**でロードし、
+  `load_tensors: layer 0..24 assigned to device RPC0` で peer へ layer が乗る
+- **実際の日本語生成が完走する**
+- requester を作り直しても **peer は無再起動で次のセッションを受ける**
+- **fd 再利用時の cleanup が効く** — peer 側 4 fd で accepted=175 / registrations=175 /
+  runtimeCloses=175 (lag 0)
+
+**未確認 — ここを「動く」と読まないこと**
+
+- Web repo の `peerManager.ts` (DataChannel 実装) を差した状態
+- SCTP backpressure / MTU / mDNS / TLS / Hono signaling
+- **実 Chrome での graceful stop** (O9 のため未実行)
+- 長時間 soak、メモリ傾向、複数 peer での layer 分割
+
+---
+
 ## 2026-08-25 時点の結論
 
 以前想定していた次の3関数は、現在の責務分担ではそのまま実装しない。
@@ -360,8 +402,52 @@ webgpu_buf_pool::cleanup()
 最初に試すべき最小修正は **requester が prompt 待ちのとき `pending_prompt` へ空文字を返し、C++ の chat loop を自然終了させてから新 Module を作る graceful stop**。`main.cpp` は prompt length 0 で loop を抜け `llama_free` / `llama_model_free` を通る。
 
 adapter はこれを実装済み (`stop()` → `pending_prompt` で空文字 → `main.cpp` の loop 終了 →
-`onExit(0)`)。**ブラウザ実測はまだ**。`_emscripten_force_exit(0)` への fallback も残してある
-(既定 5 秒待ってから)。
+`onExit(0)`)。`_emscripten_force_exit(0)` への fallback も残してある (既定 5 秒待ってから)。
+
+### 既知欠陥 O9 — graceful stop が WebGPU teardown で abort する
+
+**2026-08-26 に実測して原因を特定した。**
+
+```text
+WGPUBufferImpl::Destroy()
+  -> _emwgpuBufferDestroy
+    -> WebGPU.getJsObject
+      -> assert(ptr in WebGPU.Internals.jsObjects)   <- 失敗
+        -> abort("Assertion failed") -> ___trap() -> RuntimeError: unreachable
+```
+
+`~llama_context` がバッファ解放を完了したログの直後に起きる。**WebGPU buffer の二重破棄**であり、
+
+- `/restart` 固有ではない。**空 prompt による graceful stop でも起きる**
+- adapter の force-exit fallback が原因ではない。`stopTimeoutMs = 120000` にして
+  fallback が発火しないことを確認したうえで再現した (stop は 49.5 秒で resolve)
+
+**Web 側から見た挙動 (ここが実務上重要)**
+
+- `onError` に `requester Runtime aborted: Assertion failed` が来る
+- `stop()` は **resolve する** (hang しない)
+- **peer は無傷**で、そのまま次の requester を受け付ける
+- **次の `startRequester()` は正常に接続・生成できる**
+
+したがって **generation 切替は成立するが、stop をクリーンな成功として扱ってはいけない**。
+一方で **stop 中の `onError` を一律に無視するのも誤り**である。
+
+**非致命扱いにしてよいのは、次の 2 つを両方満たすときだけ。**
+
+1. **アプリが明示的に `stop()` を呼んでいる最中**である (自発的な世代交代であって、
+   生成中・ロード中・アイドル中の abort ではない)
+2. **既知 O9 シグネチャと一致する** cleanup abort である —
+   `requester Runtime aborted: Assertion failed` で、かつスタックに
+   `WGPUBufferImpl::Destroy()` / `_emwgpuBufferDestroy` / `WebGPU.getJsObject` を含む
+   (console 側は `RuntimeError: unreachable`)
+
+**それ以外の abort は一律で障害として扱うこと。** 生成中・ロード中に来たもの、`stop()` を
+呼んでいないときに来たもの、シグネチャが違うものを stop 中の既知事象と混ぜてはいけない。
+
+⚠️ **条件を満たす場合でもログと観測は必ず残す。** 「無視」ではなく「世代全体の致命的障害
+として扱わない」であって、発生頻度やシグネチャが変わったら upstream の状況が変わった合図になる。
+
+⚠️ **実 Chrome では stop を実行していない**ので、上記は in-app Browser pane の実測に基づく。
 
 `Module.onExit` がそもそも呼ばれるかは生成後の `llmlet-mod.js` で確認済み: `_proc_exit` は
 main thread で `Module["onExit"]?.(code)` を呼び、`callMain` が積んだ keepalive は
@@ -443,13 +529,27 @@ harness PeerManager の挙動だけで、pthread・`Module._connbuf`・WebGPU �
 
 ### HTTP URL
 
-既存 llmlet の URL 経路を使う場合:
+- **HEAD が `Content-Length` を返すこと (必須)**。返らないと `Number(null) === 0` で
+  0 バイトの仮想ファイルになり、ロードが失敗する (F13)
+- **`Range: bytes=...` に 206 を返すこと (実質必須)**
 
-- **HEAD + `Content-Length` は必須**
-- `Range: bytes=...` に対する **206 は強く推奨**
-- 206 非対応なら全体を IndexedDB へ先読みする fallback に入る
+**206 非対応だと adapter は起動のたびに GGUF 全体を IndexedDB へ先読みする。**
+キャッシュヒット判定なしで毎回やり直すので (F26)、世代交代のたびに数百 MB を書き直すことになる。
+Qwen2.5-0.5B (469 MiB) でも反復運用には重すぎる。
 
-Web repo の `/models/*` を使う場合、この条件は実測してから UI の既定経路にする。
+Runtime 側の `scripts/serve-runtime.py` は Range を実装済みで、Gate A はこの 206 経路で通した。
+Hono 側も同じ条件を満たすこと。確認は curl ではなく**実際のページから** (curl は CORS を試験しない)。
+
+```bash
+curl -I http://localhost:3000/models/your-model.gguf                  # Content-Length
+curl -H 'Range: bytes=0-1' -i http://localhost:3000/models/your.gguf  # 206 + Content-Range
+```
+
+期待値: `206 Partial Content` / `Content-Range: bytes 0-1/<size>` / `Accept-Ranges: bytes`、
+範囲外は `416` + `Content-Range: bytes */<size>`。
+
+local `File` 経路を使う場合は Range 要件そのものが無くなるが、ページをリロードするたびに
+ユーザーがファイルを選び直す必要がある。
 
 ## ホストページ要件
 

@@ -12,10 +12,16 @@ Runtime 側で llmlet と llama.cpp の実コードを読んで判明した、We
 
 ---
 
-## 2026-08-26 追記 — Runtime adapter 実装と敵対的レビューで出た項目
+## 2026-08-26 追記 — Runtime adapter 実装と実ブラウザ実測で出た項目
+
+> **引き渡しの正本は [`docs/RUNTIME_INTERFACE.md` の「引き渡しサマリ」](../RUNTIME_INTERFACE.md#引き渡しサマリ-2026-08-26)** です。
+> 成果物・API・契約・確認済みの範囲はそちらに 8 点でまとまっています。この節はそのうち
+> **Web 側でしか直せない項目**を、理由付きで再掲したものです。
 
 Runtime 側で `runtime/llmlet-runtime.js` を実装し、pin 済み llmlet / llama.cpp fork の実コードに
-対して敵対的レビューを通した結果、**Web 側でしか直せない**ものが出ました。
+対して敵対的レビューを通し、さらに **Runtime-only harness を実 Chrome で通しました**
+(接続 → RPC → 実推論 → 切断 → 再接続 → fd 再利用 cleanup まで確認済み)。その結果、
+**Web 側でしか直せない**ものが出ました。
 
 ### R1. WASM buffer を free する callback を渡さないでください (P0)
 
@@ -32,9 +38,24 @@ Runtime 側で `runtime/llmlet-runtime.js` を実装し、pin 済み llmlet / ll
 背景: `recv_peer()` は RPC を回している pthread 上で 1MiB を malloc し、その thread の
 `Module._connbuf[fd]` にキャッシュします。`register_buf()` が呼ばれるのは **slot が空のときだけ**
 なので、main thread 側で free すると `_connbuf[fd]` が free 済み領域を指したまま残ります。
-`newFd()` は `FD_MAX = 1024` を巡回するので、**fd 番号が一周した時点で use-after-free** です。
 Runtime 側は `patches/0001-llmlet-close-peer-free-connbuf.patch` で、確保した thread の
 `close_peer()` が free する形に直しました。
+
+⚠️ **fd 巡回は「いつか起きるかもしれない話」ではありません。** 実測すると llama.cpp RPC client は
+**RPC 操作ごとに socket を開閉**し、**1 回のモデルロード + 1 回の生成で 175 本**の論理接続を作ります
+(F39)。**今回と同程度の接続数が続く場合** — 1 peer / Qwen2.5-0.5B-Instruct Q4_K_M /
+1 セッション 175 接続 — `FD_MAX = 1024` は **約 6 世代で一周**します。
+
+⚠️ **この「6」は目安であって定数ではありません。** 接続数は peer 数・モデル・生成長で変わるので、
+実際の周回頻度はその構成で数えてください。確実に言えるのは **fd 番号の再利用は通常運用で起きる**
+ということだけです。
+
+⚠️ **`newFd()` の解放タイミングにも同じ種類の race があります。** 相手から close が届いた時点で
+fd 番号を再利用可能にすると、Runtime がまだその fd を持っている間に別の接続へ配られ、
+後から来る `close_peer(fd)` が**無関係な接続を切ります**。Runtime-only harness では、
+remote close では tombstone にして番号を予約したままにし、**`close_connection(fd)` が呼ばれた
+時点でのみ解放**する形に直しました (`harness/runtime-only/harness-peer-manager.js`)。
+同じ扱いを勧めます。
 
 ### R2. `peerIds` に自分自身の ID を入れないでください (P0)
 
@@ -50,6 +71,42 @@ Runtime 側に watchdog はありません。peer が DataChannel を閉じず�
 `stop()` (失敗しても force-exit へ落ちます) を呼んでから、**新しい `startRequester()` を作って**
 次の generation へ移る、が復旧契約です。
 
+### R3b. requester の stop 由来 abort は「既知・復帰可能」として扱ってください (P0)
+
+graceful stop (世代交代) のとき、requester の `onError` に
+
+```text
+requester Runtime aborted: Assertion failed
+```
+
+が来ることがあります。**WebGPU backend の teardown 不具合 (O9) で、原因は特定済み**です
+(`WGPUBufferImpl::Destroy()` → `WebGPU.getJsObject` の assert 失敗)。
+
+このとき **`stop()` は resolve し、peer は無傷で、次の `startRequester()` は正常に接続・生成できます**。
+実測で確認済みです。つまり **世代交代自体は成立します**。
+
+これを一律に致命的エラーとして扱うと **正常な世代交代が失敗に見えます**。かといって
+**stop 中の `onError` をまとめて無視するのも誤りです**。
+
+**非致命扱いにしてよいのは、次の 2 つを両方満たすときだけ。**
+
+1. **アプリが明示的に `stop()` を呼んでいる最中**である (自発的な世代交代であって、
+   生成中・ロード中・アイドル中の abort ではない)
+2. **既知 O9 シグネチャと一致する** cleanup abort である —
+   `requester Runtime aborted: Assertion failed` で、かつスタックに
+   `WGPUBufferImpl::Destroy()` / `_emwgpuBufferDestroy` / `WebGPU.getJsObject` を含む
+   (console 側は `RuntimeError: unreachable`)
+
+**それ以外の abort は一律で障害として扱うこと。** 生成中・ロード中に来たもの、`stop()` を
+呼んでいないときに来たもの、シグネチャが違うものを stop 中の既知事象と混ぜてはいけない。
+
+⚠️ **条件を満たす場合でもログと観測は必ず残す。** 「無視」ではなく「世代全体の致命的障害
+として扱わない」であって、発生頻度やシグネチャが変わったら upstream の状況が変わった合図になる。
+
+条件を満たした場合は、警告として記録したうえでそのまま新しい Runtime を作ってください。
+
+詳細: [`RUNTIME_INTERFACE.md` の O9 節](../RUNTIME_INTERFACE.md#既知欠陥-o9--graceful-stop-が-webgpu-teardown-で-abort-する)
+
 ### R4. peer の `onError` を UI / roster に繋いでください (P0)
 
 `ggml_backend_rpc_start_server` は healthy なら `accept_peer()` を回して戻りません。一方
@@ -64,6 +121,18 @@ adapter はこれを `onError` に流します。無視すると requester が�
 
 prompt / systemPrompt には **UTF-8 バイト長 < n_ctx** (既定 4096、`-c` で変更) の制限があります。
 超えると adapter が投げます (pin 済み glue は `malloc(n_ctx)` の 1 バイト先に NUL を書くため)。
+
+### R5b. GGUF 配信は Range 206 を返してください (P0 に格上げ)
+
+以前 (下記「指摘 2」) は「206 非対応でも致命傷ではない」と書きましたが、**運用上ほぼ必須です**。
+
+adapter は 206 非対応だと **起動のたびに GGUF 全体を IndexedDB へ先読みします**。キャッシュヒット
+判定なしで毎回やり直すため (F26)、世代交代のたびに数百 MB を書き直します。Qwen2.5-0.5B (469 MiB)
+でも反復運用には重すぎます。
+
+Runtime 側の `scripts/serve-runtime.py` は Range を実装済みで、Gate A の実測はこの 206 経路で
+通しました。期待値と確認方法は
+[`RUNTIME_INTERFACE.md` の model source 節](../RUNTIME_INTERFACE.md#http-url) にあります。
 
 ### R6. Runtime 成果物は `build/web-runtime/` から取ってください (P1)
 

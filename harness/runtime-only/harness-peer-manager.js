@@ -57,6 +57,12 @@ export function createHarnessPeerManager(options) {
   const connectionCounts = new Map();
   /** @type {Map<number, number>} */
   const registrationCounts = new Map();
+  /** accept() handed this fd to the Runtime this many times. */
+  /** @type {Map<number, number>} */
+  const acceptedCounts = new Map();
+  /** The Runtime called close_connection() on this fd this many times. */
+  /** @type {Map<number, number>} */
+  const runtimeCloseCounts = new Map();
 
   const bump = (counter, fd) => {
     const next = (counter.get(fd) ?? 0) + 1;
@@ -66,6 +72,8 @@ export function createHarnessPeerManager(options) {
 
   let nextFd = 0;
 
+  // conns holds tombstones as well as live connections, so a number stays reserved
+  // until the Runtime releases it.
   const newFd = () => {
     for (let i = 0; i < fdMax; i += 1) {
       if (nextFd >= fdMax) nextFd = 0;
@@ -81,10 +89,20 @@ export function createHarnessPeerManager(options) {
     transport.post({ from: nodeId, to, kind, bytes });
   };
 
-  const destroy = (conn) => {
-    // Drop the registration before waking anyone, so a parked recv cannot mistake a
-    // dead connection for a live one.
-    if (conns.get(conn.fd) === conn) conns.delete(conn.fd);
+  /**
+   * Tombstone a connection: it stops carrying data, but its fd number stays reserved.
+   *
+   * The Runtime still owns that fd after the transport drops - ggml-rpc closes the
+   * socket from socket_t's destructor, or from the server loop after
+   * rpc_serve_client() returns, both well after the peer went away. Handing the same
+   * number to a new connection in the meantime would make the Runtime's close_peer()
+   * tear down somebody else's connection, which is a harness bug that looks exactly
+   * like a Runtime bug.
+   */
+  const tombstone = (conn) => {
+    if (conn.closed) return;
+    conn.closed = true;
+    // Leave conn in `conns` so newFd() cannot reuse the number.
     if (byRemote.get(conn.remoteId) === conn) byRemote.delete(conn.remoteId);
     const queued = readyFds.indexOf(conn.fd);
     if (queued >= 0) readyFds.splice(queued, 1);
@@ -105,11 +123,13 @@ export function createHarnessPeerManager(options) {
   const createConn = (fd, remoteId) => {
     const previous = byRemote.get(remoteId);
     // The C side opens and closes sockets repeatedly over one logical link, so only
-    // one connection per remote is alive at a time.
-    if (previous) destroy(previous);
+    // one connection per remote is alive at a time. The old one is tombstoned, not
+    // released: its fd still belongs to the Runtime.
+    if (previous) tombstone(previous);
     const conn = {
       fd,
       remoteId,
+      closed: false,
       queue: [],
       queuedBytes: 0,
       wake: null,
@@ -124,10 +144,10 @@ export function createHarnessPeerManager(options) {
 
   const settleAccept = (fd, done) => {
     const conn = conns.get(fd);
-    if (!conn) return false;
+    if (!conn || conn.closed) return false;
     post(conn.remoteId, "accepted");
     done(fd);
-    emit({ type: "accept", fd, remoteId: conn.remoteId });
+    emit({ type: "accept", fd, remoteId: conn.remoteId, accepted: bump(acceptedCounts, fd) });
     return true;
   };
 
@@ -172,7 +192,7 @@ export function createHarnessPeerManager(options) {
         return;
       case "close": {
         const conn = byRemote.get(message.from);
-        if (conn) destroy(conn);
+        if (conn) tombstone(conn);
         return;
       }
       default:
@@ -206,7 +226,7 @@ export function createHarnessPeerManager(options) {
     // tensors go out as several bounded messages instead of one huge clone.
     send(fd, data) {
       const conn = conns.get(fd);
-      if (!conn) return -1;
+      if (!conn || conn.closed) return -1;
       if (data.byteLength === 0) return 0;
       const take = Math.min(SEND_CHUNK_BYTES, data.byteLength);
       try {
@@ -225,7 +245,7 @@ export function createHarnessPeerManager(options) {
 
     recv(fd, len, writeCB, doneCB) {
       const conn = conns.get(fd);
-      if (!conn) {
+      if (!conn || conn.closed) {
         doneCB(false);
         return;
       }
@@ -252,7 +272,7 @@ export function createHarnessPeerManager(options) {
       // Nothing buffered: park until data arrives or the connection dies. Calling
       // doneCB(true) with zero bytes would look like a closed peer to recv_data().
       conn.wake = () => {
-        if (conns.get(fd) !== conn) {
+        if (conns.get(fd) !== conn || conn.closed) {
           doneCB(false);
           return;
         }
@@ -261,11 +281,23 @@ export function createHarnessPeerManager(options) {
       };
     },
 
+    // The Runtime closing the fd is the only thing that releases the number for
+    // reuse. Counting these calls is how the harness observes patches/0002: the RPC
+    // server has to close the fd it accepted, or this never fires on the peer side.
     close_connection(fd) {
       const conn = conns.get(fd);
       if (!conn) return -1;
-      post(conn.remoteId, "close");
-      destroy(conn);
+      if (!conn.closed) {
+        post(conn.remoteId, "close");
+        tombstone(conn);
+      }
+      conns.delete(fd);
+      emit({
+        type: "runtime_close",
+        fd,
+        remoteId: conn.remoteId,
+        runtimeCloses: bump(runtimeCloseCounts, fd),
+      });
       return 0;
     },
 
@@ -289,8 +321,10 @@ export function createHarnessPeerManager(options) {
       });
     },
 
+    // Tombstones everything but releases nothing: the Runtime is still up and will
+    // close its fds itself. Releasing here would re-open the reuse race.
     close() {
-      for (const conn of [...conns.values()]) destroy(conn);
+      for (const conn of [...conns.values()]) tombstone(conn);
       byRemote.clear();
       readyFds.length = 0;
       // acceptWaiters survive on purpose: a peer parks in accept() before anyone
@@ -300,19 +334,41 @@ export function createHarnessPeerManager(options) {
 
     // Harness introspection, not part of the Runtime contract.
     openFds() {
+      return [...conns.keys()].filter((fd) => !conns.get(fd).closed);
+    },
+
+    /** fd numbers held by the harness, live or tombstoned. */
+    reservedFds() {
       return [...conns.keys()];
     },
 
-    /** Per fd: how many connections used it, and how many buffers it registered. */
+    /**
+     * Per fd number, across every connection that used it.
+     *
+     * accepted vs runtimeCloses separates the two patches: runtimeCloses only keeps
+     * up with accepted if the RPC server closes what it accepted (0002), and
+     * registrations only keeps up if close_peer() cleared Module._connbuf (0001).
+     */
     fdStats() {
-      const fds = new Set([...connectionCounts.keys(), ...registrationCounts.keys()]);
+      const fds = new Set([
+        ...connectionCounts.keys(),
+        ...registrationCounts.keys(),
+        ...acceptedCounts.keys(),
+        ...runtimeCloseCounts.keys(),
+      ]);
       return [...fds]
         .sort((a, b) => a - b)
-        .map((fd) => ({
-          fd,
-          connections: connectionCounts.get(fd) ?? 0,
-          registrations: registrationCounts.get(fd) ?? 0,
-        }));
+        .map((fd) => {
+          const conn = conns.get(fd);
+          return {
+            fd,
+            connections: connectionCounts.get(fd) ?? 0,
+            accepted: acceptedCounts.get(fd) ?? 0,
+            registrations: registrationCounts.get(fd) ?? 0,
+            runtimeCloses: runtimeCloseCounts.get(fd) ?? 0,
+            state: conn === undefined ? "released" : conn.closed ? "closed" : "live",
+          };
+        });
     },
   };
 }

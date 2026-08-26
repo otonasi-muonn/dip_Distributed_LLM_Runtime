@@ -115,9 +115,15 @@ Hono
 
 ### P0-A — real WASM と Web repo の縦切り統合
 
-PeerJS reference path では動いたが、Web repo の custom `PeerManager` と real WASM を一緒に動かした実測はまだありません。
+**2026-08-26 に前進**: Runtime-only harness (PeerJS / WebRTC / Hono なし、injected
+`Module.PeerManager`) で **接続 → RPC → 実推論 → 切断 → 再接続 → 再推論** が実 Chrome で
+通りました。詳細は [EXPERIMENTS.md](EXPERIMENTS.md) の Gate A。
 
-次の成功条件は **同一PCで Hono signaling → Web PeerManager → real WASM RPC → real model generation が1 prompt完走すること**。
+つまり **Web 境界より下の Runtime は単独で動く**ことが確定しました。残っているのは
+Web repo の custom `PeerManager` (DataChannel 実装) を差した状態の実測です。
+
+次の成功条件は **同一PCで Hono signaling → Web PeerManager → real WASM RPC → real model
+generation が1 prompt完走すること**。
 
 これを通すまで UI polish / 大モデル / BYOD 問題を同時に触らない。
 
@@ -194,11 +200,14 @@ Web repo には開発用 TLS の足場がありますが、飛び入り参加者
 1. ~~[RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) の最小 adapter を実装~~
    → `runtime/llmlet-runtime.js`。敵対的レビュー済み、Node lifecycle テストは通過。
    **ブラウザ実測は未実施**
-2. **`patches/` 込みで reference build を再ビルドする** (`scripts/build-llmlet-reference.ps1`)。
-   現在の `build/reference-llmlet/` は patch 前なので export が拒否する
-3. **Runtime-only harness を実ブラウザで通す** (`?role=peer` / `?role=requester` の2タブ)。
-   Web 境界より下だけを先に確定させる
+2. ~~`patches/` 込みで reference build を再ビルドする~~
+   → 完了。`build/reference-llmlet/` は patch 適用済みで `BUILD_INFO.txt` に
+   commit / patch / artifact の SHA-256 が入っている
+3. ~~Runtime-only harness を実ブラウザで通す~~
+   → **完了 (Gate A)。実 Chrome で実推論・再接続・fd 再利用まで確認**。
+   残課題は graceful stop の WebGPU teardown abort (O9 / F42)
 4. reference build artifact + adapter を Web repo の静的配信先へ渡す
+   (`scripts/export-web-runtime.ps1` → `build/web-runtime/`)
 5. 同一PCで **Hono → real PeerManager → real WASM → 1 prompt** を通す
 6. 物理2PCで同じ統合 path を通す
 7. graceful requester restart を検証 (adapter は実装済み、実測が未)

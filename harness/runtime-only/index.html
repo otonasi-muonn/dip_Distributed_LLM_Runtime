@@ -17,12 +17,12 @@
   button { font: inherit; padding: .3rem .8rem; }
   pre { background: #111; color: #eee; padding: .6rem; margin: 0; border-radius: 4px;
         overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: .8rem; }
-  #output { min-height: 8rem; max-height: 22rem; }
+  #output { min-height: 6rem; max-height: 18rem; }
   #log, #events { max-height: 14rem; }
   .env { font-size: .8rem; }
   .bad { color: #c00; font-weight: 600; }
   .good { color: #070; }
-  .note { font-size: .75rem; opacity: .75; max-width: 60rem; }
+  .note { font-size: .75rem; opacity: .75; max-width: 62rem; }
 </style>
 </head>
 <body>
@@ -43,13 +43,13 @@
 <div class="row">
   <label>role <input type="text" id="role" size="10"></label>
   <label>id <input type="text" id="id" size="10"></label>
-  <label>peers (requester, comma separated) <input type="text" id="peers" size="18"></label>
-  <label>fdmax <input type="number" id="fdmax" min="2" max="1024" style="width:5rem"></label>
+  <label>peers (requester) <input type="text" id="peers" size="16"></label>
+  <label>fdmax <input type="number" id="fdmax" min="1" max="1024" style="width:5rem"></label>
 </div>
 <div class="row" id="requesterInputs">
   <label>GGUF file <input type="file" id="modelFile"></label>
-  <label>or URL <input type="text" id="modelUrl" placeholder="http://localhost:8888/model.gguf"></label>
-  <label>generate timeout (s) <input type="number" id="timeout" value="300" min="10" style="width:5rem"></label>
+  <label>or URL <input type="text" id="modelUrl" placeholder="/model.gguf"></label>
+  <label>generate timeout (s) <input type="number" id="timeout" value="600" min="10" style="width:5rem"></label>
 </div>
 <div class="row" id="peerInputs">
   <label><input type="checkbox" id="disableWebGPU"> run this peer on CPU (-device cpu)</label>
@@ -58,27 +58,32 @@
   <button id="start">start</button>
   <button id="stop" disabled>stop</button>
   <button id="cancel" disabled>cancel generation</button>
+  <button id="resetSoak">reset soak log</button>
 </div>
 
 <div id="promptRow">
   <h2>Prompt</h2>
-  <textarea id="prompt" rows="3">日本語で自己紹介してください。</textarea>
+  <textarea id="prompt" rows="2">日本語で自己紹介してください。</textarea>
   <div class="row"><button id="generate" disabled>generate</button></div>
 </div>
 
-<h2>Model output</h2>
+<h2>Soak</h2>
+<pre id="soak">(idle)</pre>
+
+<h2>Model output (delta since ready)</h2>
 <pre id="output"></pre>
 
 <h2>fd usage</h2>
 <p class="note">
-  <code>registrations</code> counts <code>register_buf</code> calls per fd number.
-  <code>recv_peer()</code> only registers while <code>Module._connbuf[fd]</code> is empty, so a
-  reused fd registering again is what shows the slot was cleared
-  (<code>patches/0001</code>). The pointer value is not a signal: <code>malloc</code> may
-  hand back the address it just freed. This shows the stale slot is gone; it is not a
-  use-after-free reproduction.
+  Counted per fd <em>number</em>, across every connection that used it.
+  <code>accepted</code> = handed to the Runtime by <code>accept()</code>.
+  <code>runtimeCloses</code> = the Runtime called <code>close_connection()</code>, which is
+  what <code>patches/0002</code> adds on the server side. <code>registrations</code> =
+  <code>register_buf()</code> calls, which only repeat if <code>close_peer()</code> cleared
+  <code>Module._connbuf[fd]</code> (<code>patches/0001</code>). Pointer values are not a
+  signal: <code>malloc</code> may return the address it just freed.
 </p>
-<pre id="fdstats"></pre>
+<pre id="fdstats">(no connections yet)</pre>
 
 <h2>PeerManager events</h2>
 <pre id="events"></pre>
@@ -90,24 +95,36 @@
 import { startPeer, startRequester } from "./llmlet-runtime.js";
 import { createHarnessPeerManager, createBroadcastTransport } from "./harness-peer-manager.js";
 
+const CONTROL_CHANNEL = "runtime-harness-control";
+const SOAK_KEY = "runtime-harness-soak";
+
 const params = new URLSearchParams(location.search);
 const el = (id) => document.getElementById(id);
+const num = (name, fallback) => Number(params.get(name)) || fallback;
 
-const roleInput = el("role");
-const idInput = el("id");
-const peersInput = el("peers");
-const fdmaxInput = el("fdmax");
+// Explicit, so a change to the adapter default cannot silently move the pass mark.
+// Raise it with &stopms= to watch the graceful path finish on its own: at the default
+// the force-exit fallback can land in the middle of llama_free.
+const STOP_TIMEOUT_MS = num("stopms", 5000);
 
-roleInput.value = params.get("role") ?? "peer";
-idInput.value = params.get("id") ?? (roleInput.value === "requester" ? "req-1" : "peer-1");
-peersInput.value = params.get("peers") ?? "peer-1";
-fdmaxInput.value = params.get("fdmax") ?? "1024";
+const role = params.get("role") ?? "peer";
+const isRequester = role === "requester";
+const baseId = params.get("id") ?? (isRequester ? "req" : "peer-1");
+const autoMode = params.get("auto") === "1";
+const autoCycles = num("cycles", 1);
 
-const isRequester = () => roleInput.value === "requester";
-el("roleLabel").textContent = `(${roleInput.value})`;
-el("requesterInputs").style.display = isRequester() ? "" : "none";
-el("promptRow").style.display = isRequester() ? "" : "none";
-el("peerInputs").style.display = isRequester() ? "none" : "";
+el("role").value = role;
+el("id").value = baseId;
+el("peers").value = params.get("peers") ?? "peer-1";
+el("fdmax").value = String(num("fdmax", 1024));
+el("modelUrl").value = params.get("model") ?? "";
+el("prompt").value = params.get("prompt") ?? el("prompt").value;
+el("disableWebGPU").checked = params.get("cpu") === "1";
+
+el("roleLabel").textContent = `(${role}${autoMode ? " auto" : ""})`;
+el("requesterInputs").style.display = isRequester ? "" : "none";
+el("promptRow").style.display = isRequester ? "" : "none";
+el("peerInputs").style.display = isRequester ? "none" : "";
 
 // ---- environment ----------------------------------------------------------
 const checks = [
@@ -127,38 +144,140 @@ const append = (node, text) => {
   node.textContent += text;
   node.scrollTop = node.scrollHeight;
 };
-const logLine = (text) => append(el("log"), `${text}\n`);
+let sawUnreachable = false;
+const noteUnreachable = (text) => {
+  // O9. abort() calls ___trap() once the runtime is initialized, so this arrives as an
+  // uncaught rejection on the window as well as through the log.
+  if (/RuntimeError:\s*[Uu]nreachable/.test(String(text))) sawUnreachable = true;
+};
+const logLine = (text) => {
+  noteUnreachable(text);
+  append(el("log"), `${text}\n`);
+};
+window.addEventListener("error", (e) => noteUnreachable(e.message ?? e.error));
+window.addEventListener("unhandledrejection", (e) => noteUnreachable(e.reason?.message ?? e.reason));
 const eventLine = (text) => append(el("events"), `${text}\n`);
 
-// The observable for the fd reuse fix is the registration count per fd, not the
-// pointer: a reused fd that registers again proves Module._connbuf[fd] was cleared.
-let peerManager = null;
+// Output only counts after ready: Module.print carries startup stdout into the same
+// callback, so a non-empty buffer before that proves nothing about generation.
+let outputBuffer = "";
+const onText = (delta) => {
+  outputBuffer += delta;
+  append(el("output"), delta);
+};
 
-const renderFdStats = () => {
-  const rows = peerManager?.fdStats?.() ?? [];
-  el("fdstats").textContent = rows.length === 0
-    ? "(no connections yet)"
-    : ["fd  connections  registrations"]
-      .concat(rows.map((row) => {
-        const reused = row.connections > 1 ? "  <- fd reused" : "";
-        return `${String(row.fd).padEnd(4)}${String(row.connections).padEnd(13)}${row.registrations}${reused}`;
-      }))
-      .join("\n");
+// ---- control channel (harness telemetry, separate from the PeerManager) ----
+const control = new BroadcastChannel(CONTROL_CHANNEL);
+let peerManager = null;
+let latestPeerStats = null;
+
+const totalsOf = (rows) =>
+  rows.reduce(
+    (acc, row) => ({
+      accepted: acc.accepted + row.accepted,
+      runtimeCloses: acc.runtimeCloses + row.runtimeCloses,
+      registrations: acc.registrations + row.registrations,
+    }),
+    { accepted: 0, runtimeCloses: 0, registrations: 0 },
+  );
+
+const renderFdStats = (rows, label) => {
+  if (!rows || rows.length === 0) {
+    el("fdstats").textContent = "(no connections yet)";
+    return;
+  }
+  const t = totalsOf(rows);
+  const reused = rows.filter((r) => r.accepted > 1);
+  const lagging = rows.filter(
+    (r) => r.runtimeCloses !== r.accepted || r.registrations !== r.accepted,
+  );
+  const summary = [
+    `${label}: ${rows.length} fd number(s), accepted=${t.accepted} ` +
+      `registrations=${t.registrations} runtimeCloses=${t.runtimeCloses}`,
+    `reused fd numbers (accepted > 1): ${reused.length}`,
+    `fds where runtimeCloses or registrations lag accepted: ${lagging.length}`,
+  ];
+  const shown = (reused.length > 0 ? reused : rows).slice(-12);
+  const header = "fd    conns  accepted  registrations  runtimeCloses  state";
+  const body = shown.map((r) =>
+    [
+      String(r.fd).padEnd(6),
+      String(r.connections).padEnd(7),
+      String(r.accepted).padEnd(10),
+      String(r.registrations).padEnd(15),
+      String(r.runtimeCloses).padEnd(15),
+      r.state,
+    ].join(""),
+  );
+  el("fdstats").textContent = summary
+    .concat([`last ${shown.length} of ${reused.length > 0 ? "reused" : "all"}:`, header])
+    .concat(body)
+    .join("\n");
+};
+
+const publishStats = () => {
+  if (!peerManager) return;
+  const rows = peerManager.fdStats();
+  renderFdStats(rows, `local (${role})`);
+  control.postMessage({ type: "fdstats", from: baseId, role, rows });
+};
+
+control.onmessage = (event) => {
+  const message = event.data;
+  if (!message) return;
+  if (message.type === "query" && !isRequester) publishStats();
+  if (message.type === "fdstats" && message.role === "peer") {
+    latestPeerStats = message.rows;
+    if (isRequester) renderFdStats(message.rows, `peer (${message.from})`);
+  }
 };
 
 const onPeerEvent = (event) => {
   if (event.type === "register_buf") {
     eventLine(`register_buf fd=${event.fd} registration #${event.epoch} ptr=${event.ptr}`);
+  } else if (event.type === "runtime_close") {
+    eventLine(`runtime_close fd=${event.fd} close #${event.runtimeCloses}`);
   } else {
     eventLine(`${event.type} ${JSON.stringify(event)}`);
   }
-  renderFdStats();
+  publishStats();
 };
+
+const askPeerStats = (timeoutMs = 8000) =>
+  new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    latestPeerStats = null;
+    const poll = () => {
+      if (latestPeerStats) return resolve(totalsOf(latestPeerStats));
+      if (Date.now() > deadline) return reject(new Error("peer did not answer the stats query"));
+      control.postMessage({ type: "query", from: baseId });
+      setTimeout(poll, 200);
+    };
+    poll();
+  });
+
+const waitForRuntimeCloses = (atLeast, timeoutMs) =>
+  new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      if (latestPeerStats && totalsOf(latestPeerStats).runtimeCloses >= atLeast) {
+        return resolve(totalsOf(latestPeerStats));
+      }
+      if (Date.now() > deadline) {
+        const now = latestPeerStats ? totalsOf(latestPeerStats).runtimeCloses : "unknown";
+        return reject(new Error(`peer runtimeCloses stayed at ${now}, wanted ${atLeast}`));
+      }
+      control.postMessage({ type: "query", from: baseId });
+      setTimeout(poll, 200);
+    };
+    poll();
+  });
 
 // ---- runtime lifecycle ----------------------------------------------------
 let runtime = null;
 let transport = null;
 let generating = false;
+const errors = [];
 
 const setButtons = ({ started, canGenerate }) => {
   el("start").disabled = started;
@@ -175,41 +294,71 @@ const modelSource = () => {
   throw new Error("choose a GGUF file or enter a model URL");
 };
 
+function startRuntime(nodeId) {
+  transport = createBroadcastTransport("runtime-harness");
+  peerManager = createHarnessPeerManager({
+    nodeId,
+    transport,
+    fdMax: Number(el("fdmax").value) || 1024,
+    onEvent: onPeerEvent,
+  });
+
+  const onError = (error) => {
+    errors.push(error);
+    // Module.onAbort runs before abort() traps, and the adapter calls onError from
+    // inside it, so this stack still shows which JS assert fired.
+    window.__lastErrorStack = new Error("capture").stack;
+    logLine(`ERROR ${error?.message ?? error}`);
+  };
+
+  if (isRequester) {
+    const peerIds = el("peers").value.split(",").map((s) => s.trim()).filter(Boolean);
+    runtime = startRequester({
+      peerManager,
+      peerIds,
+      model: modelSource(),
+      stopTimeoutMs: STOP_TIMEOUT_MS,
+      onText,
+      onLog: logLine,
+      onError,
+    });
+    logLine(`requester ${nodeId} starting, peers=${peerIds.join(",")}`);
+  } else {
+    runtime = startPeer({
+      peerManager,
+      disableWebGPU: el("disableWebGPU").checked,
+      stopTimeoutMs: STOP_TIMEOUT_MS,
+      onLog: logLine,
+      onError,
+    });
+    logLine(`peer ${nodeId} starting`);
+  }
+  publishStats();
+}
+
+async function stopRuntime() {
+  if (!runtime) return;
+  try {
+    await runtime.stop();
+    logLine("stopped");
+  } catch (error) {
+    logLine(`stop failed: ${error?.message ?? error}`);
+  }
+  transport?.close();
+  runtime = null;
+  transport = null;
+  generating = false;
+}
+
+// ---- manual controls ------------------------------------------------------
 el("start").addEventListener("click", async () => {
   try {
     setButtons({ started: true, canGenerate: false });
-    transport = createBroadcastTransport("runtime-harness");
-    peerManager = createHarnessPeerManager({
-      nodeId: idInput.value.trim(),
-      transport,
-      fdMax: Number(fdmaxInput.value) || 1024,
-      onEvent: onPeerEvent,
-    });
-
-    if (isRequester()) {
-      const peerIds = peersInput.value.split(",").map((s) => s.trim()).filter(Boolean);
-      runtime = startRequester({
-        peerManager,
-        peerIds,
-        model: modelSource(),
-        onText: (delta) => append(el("output"), delta),
-        onLog: logLine,
-        onError: (error) => logLine(`ERROR ${error?.message ?? error}`),
-      });
-      logLine(`requester starting, peers=${peerIds.join(",")}`);
-    } else {
-      runtime = startPeer({
-        peerManager,
-        disableWebGPU: el("disableWebGPU").checked,
-        onLog: logLine,
-        onError: (error) => logLine(`ERROR ${error?.message ?? error}`),
-      });
-      logLine("peer starting");
-    }
-
+    startRuntime(el("id").value.trim());
     await runtime.ready;
+    outputBuffer = "";
     logLine("ready");
-    setButtons({ started: true, canGenerate: isRequester() });
+    setButtons({ started: true, canGenerate: isRequester });
   } catch (error) {
     logLine(`start failed: ${error?.message ?? error}`);
     setButtons({ started: false, canGenerate: false });
@@ -220,26 +369,22 @@ el("generate").addEventListener("click", async () => {
   if (!runtime) return;
   generating = true;
   setButtons({ started: true, canGenerate: false });
-  append(el("output"), "\n--- prompt ---\n");
-
-  const seconds = Number(el("timeout").value) || 300;
+  outputBuffer = "";
+  append(el("output"), "\n--- generate ---\n");
+  const seconds = Number(el("timeout").value) || 600;
   let timer = null;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(`generate() timed out after ${seconds}s`)), seconds * 1000);
   });
-
   try {
     await Promise.race([runtime.generate(el("prompt").value), timeout]);
-    logLine("generation finished");
+    logLine(`generation finished, ${outputBuffer.length} chars`);
     generating = false;
     setButtons({ started: true, canGenerate: true });
   } catch (error) {
     generating = false;
     logLine(`generation failed: ${error?.message ?? error}`);
-    // Contract: after a caller-side timeout the Runtime state is unknown. Do not retry
-    // generate(); stop and build a new Runtime. The harness enforces that by disabling
-    // generate until the operator restarts.
-    logLine("Runtime is no longer usable for another prompt. Press stop, then start.");
+    logLine("Runtime state is unknown. Press stop, then start.");
     setButtons({ started: true, canGenerate: false });
   } finally {
     clearTimeout(timer);
@@ -252,24 +397,126 @@ el("cancel").addEventListener("click", () => {
 });
 
 el("stop").addEventListener("click", async () => {
-  if (!runtime) return;
   el("stop").disabled = true;
-  try {
-    await runtime.stop();
-    logLine("stopped");
-  } catch (error) {
-    logLine(`stop failed: ${error?.message ?? error}`);
-  }
-  transport?.close();
-  runtime = null;
-  transport = null;
-  peerManager = null;
-  generating = false;
+  await stopRuntime();
   setButtons({ started: false, canGenerate: false });
 });
 
+el("resetSoak").addEventListener("click", () => {
+  localStorage.removeItem(SOAK_KEY);
+  renderSoak();
+  logLine("soak log cleared");
+});
+
+// ---- soak -----------------------------------------------------------------
+function loadSoak() {
+  try {
+    return JSON.parse(localStorage.getItem(SOAK_KEY)) ?? { cycle: 0, stopped: false, log: [] };
+  } catch {
+    return { cycle: 0, stopped: false, log: [] };
+  }
+}
+function saveSoak(state) {
+  try {
+    localStorage.setItem(SOAK_KEY, JSON.stringify(state));
+  } catch (error) {
+    logLine(`could not persist the soak log: ${error?.message ?? error}`);
+  }
+}
+function renderSoak() {
+  const state = loadSoak();
+  if (state.log.length === 0) {
+    el("soak").textContent = autoMode ? "(auto: no cycles recorded yet)" : "(idle)";
+    return;
+  }
+  const header = "cycle  ok   readyMs  genMs   chars  stopMs  closeWaitMs  note";
+  const rows = state.log.map((r) =>
+    [
+      String(r.cycle).padEnd(7),
+      (r.ok ? "yes" : "NO").padEnd(5),
+      String(r.readyMs).padEnd(9),
+      String(r.genMs).padEnd(8),
+      String(r.chars).padEnd(7),
+      String(r.stopMs).padEnd(8),
+      String(r.closeWaitMs).padEnd(13),
+      r.note ?? "",
+    ].join(""),
+  );
+  const tail = state.stopped ? "\nSTOPPED (first failure)" : "";
+  el("soak").textContent = [header].concat(rows).join("\n") + tail;
+}
+
+const timed = async (fn) => {
+  const started = performance.now();
+  await fn();
+  return Math.round(performance.now() - started);
+};
+
+async function runAutoCycle() {
+  const state = loadSoak();
+  renderSoak();
+  if (state.stopped) {
+    logLine("auto: a previous cycle failed, not continuing");
+    return;
+  }
+  if (state.cycle >= autoCycles) {
+    logLine(`auto: finished ${state.cycle} cycle(s)`);
+    return;
+  }
+
+  const cycle = state.cycle;
+  // A fresh local id per cycle: the harness keeps one live connection per remote id,
+  // so reusing the id would make the peer tombstone the previous cycle's connection
+  // instead of exercising a clean accept.
+  const nodeId = `${baseId}-c${cycle}`;
+  const record = { cycle, ok: false, readyMs: 0, genMs: 0, chars: 0, stopMs: 0, closeWaitMs: 0, note: "" };
+
+  try {
+    const before = await askPeerStats();
+    logLine(`auto cycle ${cycle} as ${nodeId}; peer accepted=${before.accepted} closes=${before.runtimeCloses}`);
+
+    startRuntime(nodeId);
+    record.readyMs = await timed(() => runtime.ready);
+    outputBuffer = "";
+    append(el("output"), `\n--- cycle ${cycle} ---\n`);
+
+    record.genMs = await timed(() => runtime.generate(el("prompt").value));
+    record.chars = outputBuffer.length;
+    if (record.chars === 0) throw new Error("generate produced no output after ready");
+
+    record.stopMs = await timed(() => stopRuntime());
+    const closeStarted = performance.now();
+    await waitForRuntimeCloses(before.runtimeCloses + 1, 20000);
+    record.closeWaitMs = Math.round(performance.now() - closeStarted);
+
+    if (errors.length > 0) throw new Error(`onError fired: ${errors[0]?.message ?? errors[0]}`);
+    if (sawUnreachable) record.note = "RuntimeError: unreachable seen";
+    if (record.stopMs >= STOP_TIMEOUT_MS) record.note = `stop used the force-exit fallback (${record.stopMs}ms)`;
+    record.ok = true;
+  } catch (error) {
+    record.note = String(error?.message ?? error);
+    logLine(`auto cycle ${cycle} failed: ${record.note}`);
+    await stopRuntime();
+  }
+
+  state.log.push(record);
+  state.cycle = cycle + 1;
+  state.stopped = !record.ok;
+  saveSoak(state);
+  renderSoak();
+
+  if (record.ok && state.cycle < autoCycles) {
+    logLine("auto: reloading for the next cycle");
+    setTimeout(() => location.reload(), 500);
+  } else {
+    logLine(`auto: done (${state.cycle} cycle(s), ${state.stopped ? "failed" : "all ok"})`);
+  }
+}
+
 setButtons({ started: false, canGenerate: false });
-renderFdStats();
+renderSoak();
+if (!isRequester) publishStats();
+if (autoMode && isRequester) runAutoCycle();
 </script>
 </body>
 </html>

@@ -135,11 +135,17 @@ The harness remains useful for isolating Runtime regressions, but it is no longe
 
 ## Next executable step
 
-The PeerJS-independent adapter (`runtime/llmlet-runtime.js`) is implemented and has been reviewed
-against the pinned llmlet and llama.cpp sources, but **it has never run in a browser**.
+The PeerJS-independent adapter (`runtime/llmlet-runtime.js`) now runs in a real browser: the
+Runtime-only harness connects a requester and a WebGPU peer, loads a dense GGUF over RPC, produces
+real output, disconnects and reconnects. See the Gate A results in
+[`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
-1. rebuild the reference artifacts with `patches/` applied
-2. pass the Runtime-only harness in a real browser (two tabs, one prompt, real output)
+One known defect remains: the requester's graceful stop aborts inside the WebGPU backend teardown
+(`WGPUBufferImpl::Destroy()`), which is the O9 entry in [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md).
+The peer survives it and the next requester connects normally.
+
+1. ~~rebuild the reference artifacts with `patches/` applied~~ — done
+2. ~~pass the Runtime-only harness in a real browser~~ — done (Gate A)
 3. hand `build/web-runtime/` to the Web repository
 4. prove **Hono signaling → Web PeerManager → real WASM → one real prompt** on one machine
 5. repeat that integrated path on two physical PCs

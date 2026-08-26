@@ -49,20 +49,20 @@ function createBus() {
   };
 }
 
-function pair(fdMax = 1024) {
+function pair(fdMaxA = 1024, fdMaxB = fdMaxA) {
   const bus = createBus();
   const events = { a: [], b: [] };
 
   const a = createHarnessPeerManager({
     nodeId: "a",
     transport: bus.endpoint(),
-    fdMax,
+    fdMax: fdMaxA,
     onEvent: (event) => events.a.push(event),
   });
   const b = createHarnessPeerManager({
     nodeId: "b",
     transport: bus.endpoint(),
-    fdMax,
+    fdMax: fdMaxB,
     onEvent: (event) => events.b.push(event),
   });
   return { a, b, events, bus };
@@ -186,39 +186,102 @@ test("closing the connection wakes a parked recv with a failure", async () => {
   assert.equal(a.close_connection(clientFd), 0);
   const result = await pending;
   assert.equal(result.ok, false);
-  assert.deepEqual(b.openFds(), []);
+  assert.deepEqual(b.openFds(), [], "no live connections left on the peer");
 });
 
-test("a reused fd registers again, whatever pointer malloc hands back", async () => {
-  const { a, b, events } = pair(2);
+test("a remote close tombstones the fd instead of freeing the number", async () => {
+  const { a, b } = pair();
+  const { clientFd, serverFd } = await link(a, b);
+
+  // a closes; b hears about it but its own Runtime has not called close_peer yet.
+  a.close_connection(clientFd);
+  await flush();
+
+  assert.deepEqual(b.openFds(), [], "the connection is no longer live");
+  assert.deepEqual(b.reservedFds(), [serverFd], "but the fd number is still reserved");
+  assert.equal(b.send(serverFd, new Uint8Array(4)), -1, "a tombstoned fd cannot send");
+  assert.equal((await receive(b, serverFd, 8)).ok, false, "and cannot receive");
+
+  const stats = b.fdStats().find((row) => row.fd === serverFd);
+  assert.equal(stats.state, "closed");
+  assert.equal(stats.runtimeCloses, 0, "the peer Runtime has not closed it yet");
+});
+
+test("a tombstoned fd is not handed out again until the Runtime closes it", async () => {
+  // Only the peer is constrained, the way it is in practice: one number to fight
+  // over there, so the race is forced.
+  const { a, b } = pair(1024, 1);
+  const first = await link(a, b);
+  assert.equal(first.serverFd, 0);
+
+  a.close_connection(first.clientFd);
+  await flush();
+
+  // A new client arrives before the peer Runtime got around to close_peer(0).
+  // Releasing fd 0 here would make the pending close_peer(0) tear down this new
+  // connection instead of the old one.
+  let secondFd = "not-called";
+  b.accept((fd) => {
+    secondFd = fd;
+  });
+  a.connect("b", () => {});
+  await flush();
+  assert.equal(secondFd, "not-called", "fd 0 must stay reserved");
+
+  // The peer Runtime finally closes it, and only then can the number be reused.
+  assert.equal(b.close_connection(first.serverFd), 0);
+  a.connect("b", () => {});
+  await flush();
+  assert.equal(secondFd, 0, "after the Runtime closed it, fd 0 comes back");
+});
+
+test("close() tombstones without releasing, because the Runtime still owns the fds", async () => {
+  const { a, b } = pair();
+  const { serverFd } = await link(a, b);
+
+  b.close();
+
+  assert.deepEqual(b.openFds(), []);
+  assert.deepEqual(b.reservedFds(), [serverFd], "close() must not re-open the reuse race");
+  assert.equal(b.fdStats().find((row) => row.fd === serverFd).runtimeCloses, 0);
+});
+
+test("a reused fd is accepted, registered and closed once per connection", async () => {
+  // One fd number on the peer, reused every cycle: exactly the shape the browser
+  // check looks for.
+  const { a, b, events } = pair(1024, 1);
 
   // Deliberately the same pointer every time. free() followed by malloc() is allowed
   // to return the address it just released, so pointer identity proves nothing about
-  // whether Module._connbuf[fd] was cleared. The registration count does, which is why
-  // the browser check counts registrations per fd instead of comparing pointers.
+  // whether Module._connbuf[fd] was cleared. The counts do, which is why the browser
+  // check compares accepted / registrations / runtimeCloses instead of pointers.
   const SAME_PTR = 0x1000;
 
-  const used = [];
-  for (let i = 0; i < 4; i += 1) {
-    const { clientFd } = await link(a, b);
-    used.push(clientFd);
-    // Stand in for recv_peer registering its receive buffer for this fd.
-    a.register_buf(clientFd, SAME_PTR);
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    const { clientFd, serverFd } = await link(a, b);
+    assert.equal(serverFd, 0, "the peer keeps reusing fd 0");
+
+    // What the peer Runtime does per connection: recv_peer registers its buffer once,
+    // then the server loop closes the fd after rpc_serve_client returns (patch 0002).
+    b.register_buf(serverFd, SAME_PTR);
     a.close_connection(clientFd);
+    await flush();
+    b.close_connection(serverFd);
     await flush();
   }
 
-  assert.deepEqual(used, [0, 1, 0, 1], "fd numbers must wrap below fdMax");
+  const peer = b.fdStats().find((row) => row.fd === 0);
+  assert.equal(peer.accepted, 3, "three connections used this fd");
+  // patch 0002: the RPC server closes the fd it accepted.
+  assert.equal(peer.runtimeCloses, peer.accepted, "every accept must be matched by a close");
+  // patch 0001: close_peer cleared Module._connbuf, so recv_peer registers again.
+  assert.equal(peer.registrations, peer.accepted, "every accept must register a buffer");
+  assert.equal(peer.state, "released");
 
-  assert.deepEqual(a.fdStats(), [
-    { fd: 0, connections: 2, registrations: 2 },
-    { fd: 1, connections: 2, registrations: 2 },
-  ]);
-
-  const epochsForFd0 = events.a
+  const epochs = events.b
     .filter((event) => event.type === "register_buf" && event.fd === 0)
     .map((event) => event.epoch);
-  assert.deepEqual(epochsForFd0, [1, 2], "a reused fd must register a second time");
+  assert.deepEqual(epochs, [1, 2, 3]);
 });
 
 test("close() drops connections but keeps a pending accept", async () => {

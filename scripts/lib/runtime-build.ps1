@@ -26,6 +26,22 @@ $RuntimePatchTargets = @(
     @{ Name = "0002-ggml-rpc-close-accepted-fd.patch"; Repo = "llama.cpp" }
 )
 
+function Write-RuntimeTextFile {
+    <#
+    .SYNOPSIS
+    Write UTF-8 without a BOM. Set-Content -Encoding utf8 on Windows PowerShell 5.1
+    prepends EF BB BF, which puts an invisible prefix on the first line for every
+    non-PowerShell reader (shell scripts, CI, the Web side).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Lines
+    )
+
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($Path, $Lines, $Utf8NoBom)
+}
+
 function Resolve-RuntimePath {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -104,7 +120,7 @@ function Write-RuntimeBuildInfo {
     $Lines += ("built_utc=" + (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
 
     $Target = Join-Path $OutputDir $RuntimeBuildInfoName
-    Set-Content -Path $Target -Value $Lines -Encoding utf8
+    Write-RuntimeTextFile -Path $Target -Lines $Lines
     return $Target
 }
 
@@ -130,6 +146,11 @@ still leaves a stale Module._connbuf slot behind when an fd number is reused
 
     pwsh -NoProfile -File scripts/build-llmlet-reference.ps1
 "@
+    }
+
+    $FirstBytes = [System.IO.File]::ReadAllBytes($InfoPath) | Select-Object -First 3
+    if ($FirstBytes.Count -ge 3 -and $FirstBytes[0] -eq 0xEF -and $FirstBytes[1] -eq 0xBB -and $FirstBytes[2] -eq 0xBF) {
+        throw "$InfoPath starts with a UTF-8 BOM. Shell and CI readers see it as part of the first key; rewrite it without one."
     }
 
     $Info = @{}
@@ -205,6 +226,6 @@ function Write-RuntimeChecksums {
         $Hash = Get-FileHash (Join-Path $Directory $Name) -Algorithm SHA256
         $Lines += ("{0}  {1}" -f $Hash.Hash, $Name)
     }
-    Set-Content -Path (Join-Path $Directory "SHA256SUMS.txt") -Value $Lines -Encoding utf8
+    Write-RuntimeTextFile -Path (Join-Path $Directory "SHA256SUMS.txt") -Lines $Lines
     return $Lines
 }

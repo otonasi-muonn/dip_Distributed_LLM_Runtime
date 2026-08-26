@@ -1,5 +1,4 @@
 # 実験計画 — モデルサイズの梯子
-
 **技術リスクを安い順に殺す**順序で並べている。
 
 規模は `short / medium / long` の目安のみで、時刻は書かない。**進捗に応じて変える前提**であり、確定していない数字を書くと後からそれがスケジュール上の事実として扱われてしまうため。イベント終了時刻が確定したら初めて時刻を乗せる。
@@ -536,3 +535,39 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 ⚠️ **2タブでは層が割れない** (F22)。Plan B を2タブで設計すると退避先が存在しなくなる。
 
 ロールバック計画は YAGNI 違反ではなく、Acceptance Criteria の一部として扱う。
+
+## 2026-08-26 Gate A — Runtime-only harness の実ブラウザ実測
+
+**構成**: patch 済み reference build (llmlet `730bad2f` + llama.cpp fork `c4b18b39` +
+`patches/0001,0002`)、同一 origin 2 タブ + BroadcastChannel (PeerJS / WebRTC / Hono なし)、
+`scripts/serve-runtime.py --model` で `/model.gguf` を 206 配信、
+Qwen2.5-0.5B-Instruct Q4_K_M (491,400,032 bytes)、peer は WebGPU (NVIDIA Turing)。
+
+| # | 項目 | 結果 |
+|---|---|---|
+| A1 | Range + `/model.gguf` | **PASS**。HEAD が `Content-Length: 491400032`、`bytes=0-1` → 206 + `Content-Range`、範囲外 → 416 + `bytes */491400032`。中間レンジは `dd` と byte 一致 |
+| A2 | real WASM requester + peer | **PASS**。環境チェック 6/6、`build: 8645 (c4b18b39d)` が pin と一致、`Starting RPC server v3.6.1` |
+| A3 | RPC への layer 割当 | **PASS**。`load_tensors: layer 0..24 assigned to device RPC0`、`RPC0[peer-1] compute buffer size = 298.50 MiB` |
+| A4 | 実出力 | **PASS**。`ready` 後にリセットしたバッファへ「私の名前は伊藤健太です。」等を生成 (3 セッションとも非空) |
+| A5 | graceful stop | **FAIL**。WebGPU buffer の二重破棄で abort (F42)。`stop()` は resolve し `onError` も出るが、クリーンではない |
+| A6 | peer 無再起動の 2 回目 | **PASS**。requester を作り直しても peer はそのままで再生成できた |
+| A7 | 安全な fdmax | **PASS**。同時 live fd は常に 1 本と実測できたので `fdmax=4` は安全。1 セッション 175 接続なので 4 で 43-44 周する |
+| A8 | fd 再利用時の cleanup | **PASS**。accepted=175 / registrations=175 / runtimeCloses=175、lag 0 (F40) |
+| A9 | 実 Chrome + WebGPU | **PASS**。環境チェック 6/6、`navigator.gpu` OK、WebGPU peer 起動、requester から実際の日本語生成成功。fd usage は **accepted=175 / registrations=175**、fd 0-3 すべて再利用。`runtimeCloses=174` は 1 本が live 中のため期待どおり |
+
+**判定**: **A5 以外はすべて PASS。**
+
+A5 は adapter ではなく **WebGPU backend の teardown 不具合** (F42) で、system としては
+復帰できている (peer 無傷・次セッション成功)。
+
+⚠️ **A9 では stop を実行していない** (A5 の既知問題のため)。したがって
+**実 Chrome における graceful stop / O9 の挙動は未計測**であり、in-app pane の結果を
+実 Chrome へそのまま外挿しない。
+
+⚠️ A9 の `accepted=175` は in-app pane の測定値と一致した。**別ブラウザで同じ接続数が
+再現した**ので、F39 の「1 セッション 175 接続」はこの構成の性質であって
+pane 固有の現象ではない。
+
+⚠️ **この harness は BroadcastChannel であり、SCTP backpressure / MTU / mDNS / TLS /
+Hono signaling を一切試験していない。** ここが通っても Web 統合が通る証明にはならない。
+所要時間は F43 のため性能指標にならない。

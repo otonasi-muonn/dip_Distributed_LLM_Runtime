@@ -593,8 +593,11 @@ pre-fix 対照は同じ harness を別ポートで、wasm `A881404F...` (0003 �
 
 | バンドル | 結果 |
 |---|---|
-| pre-fix `A881404F...` | **4/4 セッションで `onError fired: requester Runtime aborted: Assertion failed`** |
-| patched `B87861C9...` | **5/5 cycle が `ok`、note 空** |
+| pre-fix `A881404F...` | **4/4 セッションで `onError fired: requester Runtime aborted: Assertion failed`** (in-app pane) |
+| patched `B87861C9...` | **5/5 cycle が `ok`、note 空** (in-app pane) |
+
+⚠️ この A/B は **in-app pane の実測**。実 Chrome で確認したのは M5 の範囲
+(graceful stop と peer 無再起動での次 requester) までで、**5 cycle と GPU 観測は実 Chrome では未実施**。
 
 ### M4 — GPU メモリ (粗観測)
 
@@ -625,15 +628,46 @@ nvidia-smi はブラウザ・デスクトップを含むデバイス全体の粗
 0003 は GPU オブジェクトの生存期間を module/worker teardown へ意図的に委ねる修正なので、
 この測定は非 leak の証明にならない。
 
-### 副産物: peer のセッション蓄積 (O9 とは別件、未解決)
+### 副産物: peer のセッション蓄積 → O10 として分離、調査終了
 
-M3 で `readyMs` が cycle ごとに単調増加した (29.3 → 36.5 → 44.7 → 53.0 → 61.3 s)。
+M3 で `readyMs` が cycle ごとに増加した (29.3 → 36.5 → 44.7 → 53.0 → 61.3 s)。
 
 - **peer だけ再起動すると 13.3 s に戻る** (requester は毎 cycle 新しい module + reload なので requester 側ではない)
-- **pre-fix バンドルでも同じ傾き** — 同一 peer に対して warm cache のセッション 2-4 が
-  19.8 → 25.8 → 32.1 s (+6.0, +6.3 s)。**0003 由来ではない**
-- Runtime 側の蓄積か harness ページ側 (peer タブのログ DOM が無制限に伸びる。M3 終了時点で
-  `Client connection closed` が 1225 行) かは**未切り分け**
+- **pre-fix バンドルでも増加した** — 同一 peer に対して warm cache のセッション 2-4 が
+  19.8 → 25.8 → 32.1 s。**`patches/0003` 由来ではない**
+
+#### 切り分け診断 (1 回のみ実施、結果は非決定的)
+
+peer harness の観測負荷だけを落とした状態で、同じ patched バンドル・fresh peer に
+4 セッションを通した。**Runtime コードは一切変更していない。**
+
+無効化したもの (`build/runtime-harness/index.html` のみ。**commit していない**):
+
+- `#events` への per-event 追記
+- `onPeerEvent` からの per-event `publishStats()` (query 駆動の `publishStats` は残した。
+  requester の `waitForRuntimeCloses` が依存するため)
+- `#log` を末尾 200 行に制限
+
+診断が効いていた証拠: event 追記 **3500 件抑制** (`#events` は 0 文字)、
+stats 再描画 **3500 回スキップ**、`#log` は 1470 行追記に対し 5086 文字で頭打ち。peer エラー 0。
+
+| session | 線形モデル予測 (13.3 + 8.0×prior) | M3 (観測負荷あり) | 診断 (観測負荷を落とした状態) |
+|---|---|---|---|
+| 1 | 13.3 | — | 19.0 |
+| 2 | 21.3 | — | 18.4 |
+| 3 | 29.3 | 29.3 | 19.3 |
+| 4 | 37.3 | 36.5 | 37.0 |
+| 5 | 45.3 | 44.7 | — |
+| 6 | 53.3 | 53.0 | — |
+| 7 | 61.3 | 61.3 | — |
+
+- session 1→3 は横ばい (19.0 / 18.4 / 19.3)。session 3 は予測より約 10 s 低く、
+  **線形蓄積モデルは再現しなかった**
+- session 4 のみ 37.0 s へ**単発で跳ねた**。線形でもなく、n=1 では説明できない
+
+**結論: 非決定的。Runtime / harness / Chrome / WebGPU のどこが原因かは判定できない。**
+1 本追加しても判定できないため、**O9 とは独立した P1 性能課題 O10 として記録し、
+Runtime 内部の追加調査は打ち切る** ([CONSTRAINTS.md](CONSTRAINTS.md) O10)。
 
 ### 計測時に踏んだ罠
 
@@ -641,3 +675,5 @@ M3 で `readyMs` が cycle ごとに単調増加した (29.3 → 36.5 → 44.7 �
   1 つであることを確認すること。⚠️ 複数 listener が成立した機構は**未特定**
 - `patches/*.patch` が `core.autocrlf=true` の checkout で CRLF になり、`Get-FileHash` ベースの
   provenance 検証が落ちた。`.gitattributes` の `/patches/*.patch text eol=lf` で固定した
+- `git diff --check` は `patches/*.patch` の**空 context 行の marker** を trailing whitespace として
+  拾うが、これは patch の健全性の指標ではない。**patch validity は `git apply --check` で判定する**

@@ -444,7 +444,10 @@ native build の static lifetime は変えていない。
 | graceful stop + 次 requester | **実 Chrome** | abort 無し、stop 282 ms、2 人目が 299 文字生成 |
 
 pre-fix バンドル (`A881404F...`) は同じ harness で **4/4 セッションが abort** したので、
-これは直接の A/B になっている。
+これは直接の A/B になっている (in-app pane)。
+
+⚠️ **実 Chrome で確認したのは表の最終行まで。** 5 cycle 連続と GPU 観測は
+**実 Chrome では実施していない**ので、そちらの結果として読まないこと。
 
 ### Web 側が書いてはいけないもの
 
@@ -455,10 +458,11 @@ pre-fix バンドル (`A881404F...`) は同じ harness で **4/4 セッション
 
 `onError` は素直に障害として扱ってよい。
 
-⚠️ **未解決 (O9 とは別件)**: 1 つの peer が requester セッションを重ねるほど次の
-`ready` が遅くなる (patched で約 +8 s/cycle)。**pre-fix でも約 +6 s/session あったので
-`patches/0003` 由来ではない。** peer を再起動すると戻る。Runtime 側の蓄積か
-harness ページ側かは未切り分け。詳細は [EXPERIMENTS.md](EXPERIMENTS.md)。
+⚠️ **未解決 (O9 とは別件、O10)**: 1 つの peer が requester セッションを重ねると次の
+`ready` が遅くなる。**`patches/0003` 由来ではない** (pre-fix でも増加した)。peer を再起動すると戻る。
+**原因は未切り分け** — 観測負荷を落とした診断では線形の蓄積が再現せず、Runtime / harness /
+Chrome / WebGPU のどこかは判定できていない。詳細は [CONSTRAINTS.md](CONSTRAINTS.md) O10 と
+[EXPERIMENTS.md](EXPERIMENTS.md)。
 
 
 Peer server は generation ごとに再起動しない。Web 側 `PeerManager` の接続を貼り替えながら同じ RPC backend を待機させる方向を優先する。

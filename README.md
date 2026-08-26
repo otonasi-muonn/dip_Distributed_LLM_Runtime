@@ -143,8 +143,11 @@ real output, disconnects and reconnects. See the Gate A results in
 The graceful-stop defect (O9) is fixed. It was a cross-thread teardown: emdawnwebgpu keeps its JS
 handle table per Emscripten module instance, but the C++ static destructors run on the browser main
 thread, whose table is empty. `patches/0003` keeps the WebGPU registry alive for the module's
-lifetime on Emscripten only. Measured clean in the in-app pane and in real Chrome; the pre-fix
-bundle aborted on 4/4 sessions of the same harness. See F42 / F44 in
+lifetime on Emscripten only. The pre-fix bundle aborted on 4/4 sessions of the same harness.
+
+What each browser actually covered: the in-app pane ran the graceful stop, the peer-without-restart
+handover, five consecutive start/generate/stop cycles and the GPU sampling; **real Chrome ran the
+graceful stop and the peer-without-restart handover only**. See F42 / F44 in
 [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md).
 
 1. ~~rebuild the reference artifacts with `patches/` applied~~ — done

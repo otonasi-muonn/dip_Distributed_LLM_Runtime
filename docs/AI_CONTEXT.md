@@ -142,9 +142,12 @@ handle を作った pthread とは別の thread が `Destroy()` を呼んでい�
 in-app pane と実 Chrome の両方で、graceful stop → peer 無再起動で次の requester →
 5 cycle 連続まで abort 無しを実測済み。
 
-⚠️ **別件の未解決**: 1 つの peer が requester セッションを重ねるほど次の `ready` が遅くなります
-(patched で約 +8 s/cycle)。**pre-fix でも約 +6 s/session あったので `patches/0003` 由来ではありません。**
-peer を再起動すると戻ります。Runtime 側の蓄積か harness ページ側かは未切り分け。
+⚠️ **別件の未解決 (O10)**: 1 つの peer が requester セッションを重ねると次の `ready` が
+遅くなります。**`patches/0003` 由来ではありません** (pre-fix でも増加しました)。
+peer を再起動すると戻ります。**原因は未切り分け** — 観測負荷を落とした診断では線形の蓄積が
+再現せず、Runtime / harness / Chrome / WebGPU のどこかは判定できていません。
+**Runtime 内部の追加調査は打ち切り、Web 統合フェーズで実運用の世代交代に効くと分かった時点で
+切り分けます。** 詳細は [CONSTRAINTS.md](CONSTRAINTS.md) O10。
 
 ### P0-C — default Chrome の mDNS host candidate
 
@@ -209,8 +212,8 @@ Web repo には開発用 TLS の足場がありますが、飛び入り参加者
 ## 次にやること
 
 1. ~~[RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) の最小 adapter を実装~~
-   → `runtime/llmlet-runtime.js`。敵対的レビュー済み、Node lifecycle テストは通過。
-   **ブラウザ実測は未実施**
+   → `runtime/llmlet-runtime.js`。敵対的レビュー済み、Node lifecycle テスト 36 本通過。
+   **実ブラウザでも Gate A で実測済み**
 2. ~~`patches/` 込みで reference build を再ビルドする~~
    → 完了。`build/reference-llmlet/` は patch 適用済みで `BUILD_INFO.txt` に
    commit / patch / artifact の SHA-256 が入っている
@@ -218,11 +221,12 @@ Web repo には開発用 TLS の足場がありますが、飛び入り参加者
    → **完了 (Gate A)。実 Chrome で実推論・再接続・fd 再利用まで確認**。
    残課題だった graceful stop の abort (O9 / F42) も `patches/0003` で解消し、
    in-app pane と実 Chrome で再実測済み (F44)
-4. reference build artifact + adapter を Web repo の静的配信先へ渡す
+4. **← 今ここ。** reference build artifact + adapter を Web repo の静的配信先へ渡す
    (`scripts/export-web-runtime.ps1` → `build/web-runtime/`)
-5. 同一PCで **Hono → real PeerManager → real WASM → 1 prompt** を通す
+5. **← 今ここ。** 同一PCで **Hono → real PeerManager → real WASM → 1 prompt** を通す
 6. 物理2PCで同じ統合 path を通す
-7. graceful requester restart を検証 (adapter は実装済み、実測が未)
+7. ~~graceful requester restart を検証~~
+   → **完了 (2026-08-26)。** `patches/0003` で O9 を解消し、in-app pane と実 Chrome で実測
 8. dense model で「1台に載らない → 複数台で動く」を証明
 9. mDNS / shared HTTPS / consent を demo gate として解決
 

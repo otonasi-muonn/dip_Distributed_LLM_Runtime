@@ -12,6 +12,71 @@ Runtime 側で llmlet と llama.cpp の実コードを読んで判明した、We
 
 ---
 
+## 2026-08-26 追記 — Runtime adapter 実装と敵対的レビューで出た項目
+
+Runtime 側で `runtime/llmlet-runtime.js` を実装し、pin 済み llmlet / llama.cpp fork の実コードに
+対して敵対的レビューを通した結果、**Web 側でしか直せない**ものが出ました。
+
+### R1. WASM buffer を free する callback を渡さないでください (P0)
+
+`createPeerManager({ releaseBuf })` について。
+
+- **禁止**: `releaseBuf: Module.release_conn` のように**実際に free する関数**を渡すこと。
+  受信バッファの所有権は WASM glue 側 (`close_peer` と同じ thread) に一本化したので、
+  **double free** になります。
+- **安全だが不要**: adapter の `releaseConn` は deprecated な no-op なので、
+  `releaseBuf: (ptr) => runtime.releaseConn(ptr)` を渡しても壊れません。何もしないだけです。
+  次の機会に外してください。
+- `register_buf` は**記録・ログのみ**に使ってください。
+
+背景: `recv_peer()` は RPC を回している pthread 上で 1MiB を malloc し、その thread の
+`Module._connbuf[fd]` にキャッシュします。`register_buf()` が呼ばれるのは **slot が空のときだけ**
+なので、main thread 側で free すると `_connbuf[fd]` が free 済み領域を指したまま残ります。
+`newFd()` は `FD_MAX = 1024` を巡回するので、**fd 番号が一周した時点で use-after-free** です。
+Runtime 側は `patches/0001-llmlet-close-peer-free-connbuf.patch` で、確保した thread の
+`close_peer()` が free する形に直しました。
+
+### R2. `peerIds` に自分自身の ID を入れないでください (P0)
+
+上流 llmlet は `if (peersList[i] == peer.peer.id) continue;` で自己除外していましたが、
+adapter は自分の ID を知りません。requester の `-rpc` 引数は渡された配列そのままです。
+
+### R3. `generate()` には呼び出し側 timeout が必要です (P0)
+
+Runtime 側に watchdog はありません。peer が DataChannel を閉じずに死ぬと、RPC は
+`Atomics.wait()` の中で止まり、adapter からは観測できません。
+
+**timeout 後の Runtime は状態不明なので、`generate()` を再試行しないでください。**
+`stop()` (失敗しても force-exit へ落ちます) を呼んでから、**新しい `startRequester()` を作って**
+次の generation へ移る、が復旧契約です。
+
+### R4. peer の `onError` を UI / roster に繋いでください (P0)
+
+`ggml_backend_rpc_start_server` は healthy なら `accept_peer()` を回して戻りません。一方
+**backend device の初期化に失敗すると early return して main が exit code 0 で終わります**。
+つまり **peer の exit は常に異常**で、code 0 でも「WebGPU も CPU も掴めなかった」の意味です。
+adapter はこれを `onError` に流します。無視すると requester が接続待ちのまま固まります。
+
+### R5. `options.args` は flag だけにしてください (P1)
+
+`options.args` は `Module.arguments` の**先頭**に入ります。`main.cpp` の parser は未知の token を
+「ここから prompt」と解釈して打ち切るので、位置引数を入れると以降の `-rpc` / `-m` が消えます。
+
+prompt / systemPrompt には **UTF-8 バイト長 < n_ctx** (既定 4096、`-c` で変更) の制限があります。
+超えると adapter が投げます (pin 済み glue は `malloc(n_ctx)` の 1 バイト先に NUL を書くため)。
+
+### R6. Runtime 成果物は `build/web-runtime/` から取ってください (P1)
+
+`scripts/export-web-runtime.ps1` が `llmlet-mod.js` / `llmlet-mod.wasm` / `llmlet-runtime.js` と
+`BUILD_INFO.txt` / `SHA256SUMS.txt` を出します。Runtime 側は Web repo のディレクトリ構成を
+知らないので、静的配信先へのコピーは Web 側で行ってください。
+
+**reference build は「pin 済み commit + `patches/*.patch`」です。**`BUILD_INFO.txt` に
+llmlet / llama.cpp の commit と各 patch の SHA-256 が入っています。patch 前の成果物は
+export スクリプトが拒否しますが、受け取り側でも `BUILD_INFO.txt` の同梱を確認してください。
+
+---
+
 ## P0
 
 ### 1. Runtime API に prompt 投入経路と model source が無い

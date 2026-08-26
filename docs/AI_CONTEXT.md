@@ -162,7 +162,10 @@ Requester の RPC peer list は process 起動時の `-rpc` 引数で固定さ�
 
 既存 llmlet `startClient` / `startServer` からこの glue を再利用し、`newPeerManager()` だけを注入式へ変えるのが最小変更です。
 
-なお pin 済み Makefile はすでに `release_conn` を `EXPORTED_RUNTIME_METHODS` に含めています。
+**`release_conn` は使わないこと。** pin 済み Makefile は export していますが、受信バッファは
+それを malloc した pthread の `Module._connbuf[fd]` に残り続けるため、main thread から free すると
+fd 再利用時に use-after-free になります。`patches/0001` で `close_peer()` 側の解放に直しました
+(詳細と Web 側への影響は [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) の「受信バッファの所有権」)。
 
 ## 出力 API の注意
 
@@ -188,13 +191,19 @@ Web repo には開発用 TLS の足場がありますが、飛び入り参加者
 
 ## 次にやること
 
-1. [RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) の最小 adapter を実装
-2. reference build artifact + adapter を Web repo `/wasm/` へ渡す
-3. 同一PCで **Hono → real PeerManager → real WASM → 1 prompt** を通す
-4. 物理2PCで同じ統合 path を通す
-5. graceful requester restart を検証
-6. dense model で「1台に載らない → 複数台で動く」を証明
-7. mDNS / shared HTTPS / consent を demo gate として解決
+1. ~~[RUNTIME_INTERFACE.md](RUNTIME_INTERFACE.md) の最小 adapter を実装~~
+   → `runtime/llmlet-runtime.js`。敵対的レビュー済み、Node lifecycle テストは通過。
+   **ブラウザ実測は未実施**
+2. **`patches/` 込みで reference build を再ビルドする** (`scripts/build-llmlet-reference.ps1`)。
+   現在の `build/reference-llmlet/` は patch 前なので export が拒否する
+3. **Runtime-only harness を実ブラウザで通す** (`?role=peer` / `?role=requester` の2タブ)。
+   Web 境界より下だけを先に確定させる
+4. reference build artifact + adapter を Web repo の静的配信先へ渡す
+5. 同一PCで **Hono → real PeerManager → real WASM → 1 prompt** を通す
+6. 物理2PCで同じ統合 path を通す
+7. graceful requester restart を検証 (adapter は実装済み、実測が未)
+8. dense model で「1台に載らない → 複数台で動く」を証明
+9. mDNS / shared HTTPS / consent を demo gate として解決
 
 ## 関連リポジトリ
 

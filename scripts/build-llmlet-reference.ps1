@@ -3,10 +3,13 @@ param(
     [string]$OutputDir = "build/reference-llmlet"
 )
 
+# Reproducible Runtime reference build: pinned llmlet commit + pinned llama.cpp fork
+# commit + patches/*.patch, built in the upstream Docker image.
+
 $ErrorActionPreference = "Stop"
 
-$LlmletRepository = "https://github.com/ktock/llmlet.git"
-$LlmletCommit = "730bad2f5b4d6598f55b09eb22d54b5bf2a467ed"
+$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $PSScriptRoot "lib/runtime-build.ps1")
 
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
@@ -42,13 +45,17 @@ Require-Command "git"
 Require-Command "docker"
 Assert-DockerDaemon
 
-$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$ResolvedWorkDir = Join-Path $RepositoryRoot $WorkDir
-$ResolvedOutputDir = Join-Path $RepositoryRoot $OutputDir
+$ResolvedWorkDir = Resolve-RuntimePath -Root $RepositoryRoot -Path $WorkDir
+$ResolvedOutputDir = Resolve-RuntimePath -Root $RepositoryRoot -Path $OutputDir
+$PatchDir = Join-Path $RepositoryRoot "patches"
+
+# Read the patch set first: a missing or unregistered patch should fail before we
+# touch the checkout.
+$Patches = Get-RuntimePatchInventory -PatchDir $PatchDir
 
 if (-not (Test-Path $ResolvedWorkDir)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $ResolvedWorkDir -Parent) | Out-Null
-    git clone --recurse-submodules $LlmletRepository $ResolvedWorkDir
+    git clone --recurse-submodules $RuntimeLlmletRepository $ResolvedWorkDir
     Assert-LastExitCode "git clone"
 }
 
@@ -58,52 +65,94 @@ try {
     Assert-LastExitCode "git remote get-url origin"
     $Origin = $Origin.Trim()
 
-    if ($Origin -ne $LlmletRepository) {
-        throw "Existing worktree at '$ResolvedWorkDir' does not point to $LlmletRepository."
+    if ($Origin -ne $RuntimeLlmletRepository) {
+        throw "Existing worktree at '$ResolvedWorkDir' does not point to $RuntimeLlmletRepository."
     }
 
     git fetch origin
     Assert-LastExitCode "git fetch origin"
 
-    git checkout --detach $LlmletCommit
+    # Drop patches applied by a previous run so the build always starts from the pin.
+    # git clean is deliberately not used: it would delete local build output.
+    git reset --hard
+    Assert-LastExitCode "git reset --hard"
+
+    git checkout --detach $RuntimeLlmletCommit
     Assert-LastExitCode "git checkout"
 
     git submodule sync --recursive
     Assert-LastExitCode "git submodule sync"
 
-    git submodule update --init --recursive
+    git submodule update --init --recursive --force
     Assert-LastExitCode "git submodule update"
 
-    $ActualCommit = git rev-parse HEAD
+    git submodule foreach --recursive git reset --hard
+    Assert-LastExitCode "git submodule reset"
+
+    $ActualCommit = (git rev-parse HEAD).Trim()
     Assert-LastExitCode "git rev-parse HEAD"
-    $ActualCommit = $ActualCommit.Trim()
-
-    if ($ActualCommit -ne $LlmletCommit) {
-        throw "Expected llmlet commit $LlmletCommit but checked out $ActualCommit."
+    if ($ActualCommit -ne $RuntimeLlmletCommit) {
+        throw "Expected llmlet commit $RuntimeLlmletCommit but checked out $ActualCommit."
     }
 
-    if (Test-Path $ResolvedOutputDir) {
-        Remove-Item -Recurse -Force $ResolvedOutputDir
+    $ActualLlamaCpp = (git -C "llama.cpp" rev-parse HEAD).Trim()
+    Assert-LastExitCode "git rev-parse llama.cpp HEAD"
+    if ($ActualLlamaCpp -ne $RuntimeLlamaCppCommit) {
+        throw "Expected llama.cpp commit $RuntimeLlamaCppCommit but checked out $ActualLlamaCpp."
     }
-    New-Item -ItemType Directory -Force -Path $ResolvedOutputDir | Out-Null
 
-    Write-Host "Building llmlet reference at $LlmletCommit"
-    docker build --output "type=local,dest=$ResolvedOutputDir" .
-    Assert-LastExitCode "docker build"
+    foreach ($Patch in $Patches) {
+        Write-Host "Applying $($Patch.Name) to $($Patch.Repo)"
+        git -C $Patch.Repo apply --check $Patch.Path
+        Assert-LastExitCode "git apply --check $($Patch.Name)"
+        git -C $Patch.Repo apply $Patch.Path
+        Assert-LastExitCode "git apply $($Patch.Name)"
+    }
 
-    $ExpectedArtifacts = @(
-        (Join-Path $ResolvedOutputDir "llmlet-mod.js"),
-        (Join-Path $ResolvedOutputDir "llmlet-mod.wasm")
-    )
+    # Build into a staging directory and only publish it once everything passed.
+    #
+    # Writing straight into the output directory would mean a failed or partial
+    # `docker build --output` leaves half a build there, and it would destroy the
+    # previous working artifacts before we know the new ones are any good. Nothing
+    # outside this block ever sees a directory that has BUILD_INFO.txt without the
+    # artifacts it describes.
+    $StagingDir = "$ResolvedOutputDir.staging"
+    if (Test-Path $StagingDir) {
+        Remove-Item -Recurse -Force $StagingDir
+    }
+    New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
 
-    foreach ($Artifact in $ExpectedArtifacts) {
-        if (-not (Test-Path $Artifact)) {
-            throw "Build completed without expected artifact: $Artifact"
+    try {
+        Write-Host "Building llmlet reference at $RuntimeLlmletCommit + $($Patches.Count) patch(es)"
+        docker build --output "type=local,dest=$StagingDir" .
+        Assert-LastExitCode "docker build"
+
+        foreach ($Name in $RuntimeBuildArtifacts) {
+            if (-not (Test-Path (Join-Path $StagingDir $Name) -PathType Leaf)) {
+                throw "Build completed without expected artifact: $Name"
+            }
+        }
+
+        # Provenance is written last, and it hashes the artifacts next to it.
+        Write-RuntimeBuildInfo -OutputDir $StagingDir -PatchDir $PatchDir | Out-Null
+        Assert-RuntimeReferenceBuild -Directory $StagingDir -PatchDir $PatchDir
+
+        if (Test-Path $ResolvedOutputDir) {
+            Remove-Item -Recurse -Force $ResolvedOutputDir
+        }
+        Move-Item -Path $StagingDir -Destination $ResolvedOutputDir
+    }
+    finally {
+        # On any failure the staging directory goes away, so a later run cannot pick
+        # up a half-finished build and the previous output directory is untouched.
+        if (Test-Path $StagingDir) {
+            Remove-Item -Recurse -Force $StagingDir
         }
     }
 
     Write-Host "Reference build completed."
     Write-Host "Artifacts: $ResolvedOutputDir"
+    Write-Host "Provenance: $(Join-Path $ResolvedOutputDir $RuntimeBuildInfoName)"
 }
 finally {
     Pop-Location

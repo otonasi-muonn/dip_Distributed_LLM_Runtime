@@ -1,0 +1,16 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 197cb0508..a1c339818 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1904,6 +1904,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         rpc_serve_client(backends, cache_dir, fd);
+         printf("Client connection closed\n");
+         fflush(stdout);
++        // The server never closed the fd it accepted, so the transport kept the
++        // connection state alive for every client that ever connected. In the
++        // Emscripten build that also pins a 1 MiB receive buffer per fd inside
++        // Module._connbuf, and leaves a reused fd number bound to a stale one.
++        close_peer(fd);
+     }
+ #ifdef _WIN32
+     WSACleanup();

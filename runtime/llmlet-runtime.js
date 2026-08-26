@@ -9,6 +9,8 @@
 
 const CHUNK_MAX = 100_000_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
+// main.cpp defaults to `int n_ctx = 4096` and overrides it from -c.
+const DEFAULT_CONTEXT_SIZE = 4096;
 
 function deferred() {
   let resolve;
@@ -105,6 +107,12 @@ async function openChunkCache() {
       tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted"));
     });
 
+  // libllmlet.js `cache_get_inner` only notifies the waiting pthread from the
+  // resolve path; its .catch just logs. A rejected get therefore leaves the RPC
+  // thread parked in Atomics.wait() forever, which wedges the whole peer. Never
+  // reject: a broken IndexedDB is reported as a cache miss.
+  let getFailureLogged = false;
+
   return {
     db,
     storeName,
@@ -120,19 +128,29 @@ async function openChunkCache() {
       await Promise.all([reqDone, txDone]);
     },
     async get(key) {
-      const tx = db.transaction(storeName, "readonly");
-      // Register completion handlers before waiting for the request. A readonly
-      // transaction is allowed to complete immediately after its request succeeds;
-      // attaching oncomplete afterwards can miss the event and hang forever.
-      const txDone = transactionDone(tx);
-      const store = tx.objectStore(storeName);
-      const reqDone = new Promise((resolve, reject) => {
-        const req = store.get(key);
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error ?? new Error("ChunkCache get failed"));
-      });
-      const [value] = await Promise.all([reqDone, txDone]);
-      return value;
+      try {
+        // db.transaction() throws synchronously once the database is closed, so it
+        // has to be inside the try as well.
+        const tx = db.transaction(storeName, "readonly");
+        // Register completion handlers before waiting for the request. A readonly
+        // transaction is allowed to complete immediately after its request succeeds;
+        // attaching oncomplete afterwards can miss the event and hang forever.
+        const txDone = transactionDone(tx);
+        const store = tx.objectStore(storeName);
+        const reqDone = new Promise((resolve, reject) => {
+          const req = store.get(key);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error ?? new Error("ChunkCache get failed"));
+        });
+        const [value] = await Promise.all([reqDone, txDone]);
+        return value;
+      } catch (error) {
+        if (!getFailureLogged) {
+          getFailureLogged = true;
+          console.warn("ChunkCache read failed; treating cache lookups as misses", error);
+        }
+        return undefined;
+      }
     },
     close() {
       db.close();
@@ -197,6 +215,10 @@ function addRemoteFile(Module, chunkCache, fileId, dir, fileName, size, fetchRan
                 if (Object.keys(node.waitingTable).length > maxEntries) {
                   let oldest = null;
                   for (const key in node.waitingTable) {
+                    // A chunk that is still loading is always the least recently used
+                    // one. Evicting it makes its own completion callback write to a
+                    // deleted entry, which surfaces as an unrelated model load error.
+                    if (node.waitingTable[key].done !== true) continue;
                     if (oldest === null || node.waitingTable[key].lastUsed < node.waitingTable[oldest].lastUsed) {
                       oldest = key;
                     }
@@ -385,6 +407,36 @@ function utf8BinaryString(text) {
   return out;
 }
 
+function contextSizeFromArgs(args) {
+  if (!Array.isArray(args)) return DEFAULT_CONTEXT_SIZE;
+  // main.cpp parses -c left to right and keeps the last value it sees.
+  for (let i = args.length - 2; i >= 0; i -= 1) {
+    if (args[i] !== "-c") continue;
+    const parsed = Number.parseInt(args[i + 1], 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_CONTEXT_SIZE;
+  }
+  return DEFAULT_CONTEXT_SIZE;
+}
+
+/**
+ * Encode a prompt the way libllmlet.js expects and reject anything that would not
+ * fit the Runtime side buffer.
+ *
+ * get_system_prompt()/get_next_prompt() copy into a malloc(n_ctx) buffer and then
+ * write a terminating NUL at buffer[min(bytes, n_ctx)], so exactly n_ctx bytes
+ * already write one byte past the allocation. They also cut on a byte boundary,
+ * which splits multibyte characters.
+ */
+function encodePromptForRuntime(text, contextSize, label) {
+  const encoded = utf8BinaryString(text);
+  if (encoded.length >= contextSize) {
+    throw new Error(
+      `${label} is ${encoded.length} UTF-8 bytes; the Runtime accepts at most ${contextSize - 1}`,
+    );
+  }
+  return encoded;
+}
+
 function createUtf8Output(onText) {
   const decoder = new TextDecoder("utf-8");
   return {
@@ -433,6 +485,28 @@ function configureNoColor(Module) {
   });
 }
 
+let releaseConnWarned = false;
+
+/**
+ * Deprecated no-op, kept so a caller that already wires this into the
+ * PeerManager's releaseBuf keeps working.
+ *
+ * The receive buffer belongs to the WASM glue: recv_peer() mallocs it on the RPC
+ * pthread, caches it in that thread's Module._connbuf[fd], and only calls
+ * register_buf() while the slot is empty. Freeing it from the main thread leaves
+ * that per-thread cache pointing at freed memory once the fd number is reused.
+ * patches/0001-llmlet-close-peer-free-connbuf.patch frees it inside close_peer(),
+ * on the thread that owns it, so nothing outside the glue may free it.
+ */
+function deprecatedReleaseConn() {
+  if (releaseConnWarned) return;
+  releaseConnWarned = true;
+  console.warn(
+    "llmlet Runtime: releaseConn() is a no-op. The receive buffer is freed by the WASM " +
+      "glue; passing releaseBuf to the PeerManager is unnecessary.",
+  );
+}
+
 function safeForceExit(Module) {
   try {
     Module?._emscripten_force_exit?.(0);
@@ -455,6 +529,7 @@ export function startPeer(options) {
   requirePeerManager(options?.peerManager);
 
   const baseUrl = resolveBaseUrl(options.baseUrl);
+  const stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const ready = deferred();
   const exited = deferred();
   let Module = null;
@@ -489,35 +564,52 @@ export function startPeer(options) {
       Module.onRuntimeInitialized = () => settleResolve(ready);
       Module.onExit = (code) => {
         chunkCache?.close();
-        if (!stopping && code !== 0) fail(new Error(`peer Runtime exited with code ${code}`));
-        else settleResolve(exited);
+        if (stopping) {
+          settleResolve(exited);
+          return;
+        }
+        // A healthy RPC server never returns: ggml_backend_rpc_start_server loops on
+        // accept_peer() forever. It does return early when a backend device fails to
+        // initialize, and main() then exits 0. So an exit nobody asked for is a failure
+        // regardless of the code, and code 0 in particular usually means "no backend".
+        fail(new Error(`peer Runtime exited unexpectedly with code ${code}`));
       };
       Module.onAbort = (reason) => fail(new Error(`peer Runtime aborted: ${String(reason)}`));
 
+      // stop() can land while the dynamic import or IndexedDB open is still in flight.
+      // Without this the Runtime would start after the caller already gave up on it.
+      if (stopping) {
+        chunkCache.close();
+        settleResolve(exited);
+        return;
+      }
+
       await moduleFactory.default(Module);
+      if (stopping) safeForceExit(Module);
       // Some Emscripten configurations do not call a user supplied hook; factory
       // resolution still means the runtime has initialized.
-      settleResolve(ready);
+      else settleResolve(ready);
     } catch (error) {
+      chunkCache?.close();
       fail(error);
     }
   })();
 
   return {
     ready: ready.promise,
-    releaseConn(ptr) {
-      Module?.release_conn?.(ptr);
-    },
+    releaseConn: deprecatedReleaseConn,
     async stop() {
-      if (stopping) return exited.promise.catch(() => {});
       stopping = true;
       try {
         options.peerManager.close();
       } finally {
         safeForceExit(Module);
       }
-      const clean = await waitOrTimeout(exited.promise, options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
+      const clean = await waitOrTimeout(exited.promise, stopTimeoutMs);
       if (!clean) chunkCache?.close();
+      // No-op once ready settled. Without it, stopping before startup finished would
+      // leave anyone awaiting ready parked forever.
+      settleReject(ready, new Error("peer Runtime was stopped before it became ready"));
     },
   };
 }
@@ -527,6 +619,11 @@ export function startPeer(options) {
  *
  * generate() resolves when C++ finishes the answer and asks for the next prompt. This
  * gives us an explicit generation boundary without guessing from trailing newlines.
+ *
+ * generate() has no internal watchdog. If a peer dies without closing its DataChannel
+ * the RPC call blocks inside Atomics.wait() and nothing here can observe it, so the
+ * caller needs its own timeout. After such a timeout the Runtime state is unknown:
+ * call stop() and build a new Runtime instead of retrying generate().
  */
 export function startRequester(options) {
   requireBrowserRuntime();
@@ -538,7 +635,15 @@ export function startRequester(options) {
     throw new Error("peerIds must not contain duplicates");
   }
 
+  const contextSize = contextSizeFromArgs(options.args);
+  const systemPrompt = encodePromptForRuntime(
+    options.systemPrompt ?? "",
+    contextSize,
+    "systemPrompt",
+  );
+
   const baseUrl = resolveBaseUrl(options.baseUrl);
+  const stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const ready = deferred();
   const exited = deferred();
   const output = createUtf8Output(options.onText);
@@ -551,22 +656,32 @@ export function startRequester(options) {
   let stopRequested = false;
   let stopped = false;
 
+  // stop() cuts a generation short via isDecodingCancel(), so its output is a partial
+  // answer. Resolving generate() there would report truncated text as a finished one.
+  const abortGeneration = (error) => {
+    if (!activeGeneration) return;
+    const done = activeGeneration;
+    activeGeneration = null;
+    cancelRequested = false;
+    settleReject(done, error);
+  };
+
+  const stopError = () => new Error("generation was interrupted by stop()");
+
   const fail = (value) => {
     const error = asError(value);
+    output.flush();
     emit(options.onError, error);
     settleReject(ready, error);
-    if (activeGeneration) {
-      settleReject(activeGeneration, error);
-      activeGeneration = null;
-    }
+    abortGeneration(error);
     settleReject(exited, error);
   };
 
-  const deliverPrompt = (text) => {
+  const deliverPrompt = (encoded) => {
     const cb = promptWaiter;
     promptWaiter = null;
     if (!cb) return false;
-    cb(utf8BinaryString(text));
+    cb(encoded);
     return true;
   };
 
@@ -589,17 +704,21 @@ export function startRequester(options) {
       if (Array.isArray(options.args)) Module.arguments.unshift(...options.args);
 
       Module.isDecodingCancel = () => (cancelRequested ? 1 : 0);
-      Module.pending_system_prompt = (cb) => cb(utf8BinaryString(options.systemPrompt ?? ""));
+      Module.pending_system_prompt = (cb) => cb(systemPrompt);
       Module.pending_prompt = (cb) => {
         // Reaching this callback means model/context initialization succeeded and C++
         // is waiting for input. On later calls it also marks the previous generation done.
         settleResolve(ready);
 
         if (activeGeneration) {
-          const done = activeGeneration;
-          activeGeneration = null;
-          cancelRequested = false;
-          settleResolve(done);
+          if (stopRequested) {
+            abortGeneration(stopError());
+          } else {
+            const done = activeGeneration;
+            activeGeneration = null;
+            cancelRequested = false;
+            settleResolve(done);
+          }
         }
 
         if (stopRequested) {
@@ -618,12 +737,32 @@ export function startRequester(options) {
         stopped = true;
         output.flush();
         chunkCache?.close();
-        if (!stopRequested && code !== 0) fail(new Error(`requester Runtime exited with code ${code}`));
-        else settleResolve(exited);
+        if (stopRequested) {
+          // Force-exit skips pending_prompt entirely, so settle any generation here too.
+          abortGeneration(stopError());
+          settleResolve(exited);
+          return;
+        }
+        // main() only returns 0 after get_next_prompt() reported an empty prompt, and
+        // the adapter only sends one while stopping. An exit nobody asked for is a
+        // failure regardless of the code; treating code 0 as success used to leave
+        // generate() pending forever.
+        fail(new Error(`requester Runtime exited unexpectedly with code ${code}`));
       };
       Module.onAbort = (reason) => fail(new Error(`requester Runtime aborted: ${String(reason)}`));
 
+      // stop() can land while the dynamic import, IndexedDB open or model HEAD request
+      // is still in flight. pending_prompt would eventually end the session anyway, but
+      // only after a full model load, so refuse to start instead.
+      if (stopRequested) {
+        stopped = true;
+        chunkCache.close();
+        settleResolve(exited);
+        return;
+      }
+
       await moduleFactory.default(Module);
+      if (stopRequested) safeForceExit(Module);
 
       // Upstream llmlet overrides put_char after factory initialization so output can
       // stream before a full line is available. Use an incremental UTF-8 decoder here;
@@ -632,38 +771,41 @@ export function startRequester(options) {
         Module.TTY.default_tty_ops.put_char = (_tty, value) => output.byte(value);
       }
     } catch (error) {
+      chunkCache?.close();
       fail(error);
     }
   })();
 
   return {
     ready: ready.promise,
-    releaseConn(ptr) {
-      Module?.release_conn?.(ptr);
-    },
+    releaseConn: deprecatedReleaseConn,
     async generate(prompt) {
       if (typeof prompt !== "string" || prompt.length === 0) {
         throw new Error("prompt must be a non-empty string");
       }
       if (stopRequested || stopped) throw new Error("requester Runtime is stopping/stopped");
+      const encoded = encodePromptForRuntime(prompt, contextSize, "prompt");
       await ready.promise;
+      // ready may have settled while stop() was already running.
+      if (stopRequested || stopped) throw new Error("requester Runtime is stopping/stopped");
       if (activeGeneration) throw new Error("a generation is already running");
       if (!promptWaiter) throw new Error("requester is not waiting for a prompt");
 
       const generation = deferred();
       activeGeneration = generation;
       cancelRequested = false;
-      if (!deliverPrompt(prompt)) {
+      if (!deliverPrompt(encoded)) {
         activeGeneration = null;
         throw new Error("failed to deliver prompt to Runtime");
       }
       return generation.promise;
     },
+    // Unlike stop(), cancel() resolves the running generation: the caller asked for a
+    // short answer and the Runtime stays usable for the next one.
     cancel() {
       if (activeGeneration) cancelRequested = true;
     },
     async stop() {
-      if (stopRequested) return exited.promise.catch(() => {});
       stopRequested = true;
       cancelRequested = true;
 
@@ -672,7 +814,7 @@ export function startRequester(options) {
       // stopRequested branch sends the empty prompt.
       if (promptWaiter) deliverPrompt("");
 
-      let clean = await waitOrTimeout(exited.promise, options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
+      let clean = await waitOrTimeout(exited.promise, stopTimeoutMs);
       if (!clean) {
         // Fallback only. O9 has shown this path can throw during WebGPU cleanup.
         options.peerManager.close();
@@ -680,6 +822,10 @@ export function startRequester(options) {
         clean = await waitOrTimeout(exited.promise, 1_000);
       }
       if (!clean) chunkCache?.close();
+      // Backstops. Both are no-ops when the normal path already settled them, and both
+      // matter when the Runtime never reached pending_prompt or onExit at all.
+      abortGeneration(stopError());
+      settleReject(ready, new Error("requester Runtime was stopped before it became ready"));
     },
   };
 }

@@ -55,7 +55,45 @@ pin 済み Makefile はすでに以下を満たす。
 - `-sEXPORTED_FUNCTIONS=_main,_emscripten_force_exit`
 - `-sEXPORTED_RUNTIME_METHODS=FS,PThread,ENV,release_conn,TTY`
 
-したがって **`release_conn` を追加 export するためのビルド変更は不要**。既存成果物に含まれる。
+### reference build = pin 済み commit + patch
+
+Runtime は **素の llmlet を配らない**。`patches/` に置いた最小 patch を当てたものが reference build。
+
+| patch | 対象 | 内容 |
+|---|---|---|
+| `0001-llmlet-close-peer-free-connbuf.patch` | `libllmlet.js` | `close_peer()` が `Module._connbuf[fd]` を free して entry も削除する |
+| `0002-ggml-rpc-close-accepted-fd.patch` | `ggml-rpc.cpp` | RPC server が accept した fd を `close_peer()` で閉じる |
+
+理由は「受信バッファの所有権」節を参照。
+
+`scripts/build-llmlet-reference.ps1` は pin へ `reset --hard` してから patch を当て、
+**staging ディレクトリでビルドしてから成功時だけ出力先へ差し替える**。`BUILD_INFO.txt` は
+最後に書かれ、llmlet commit / llama.cpp commit / 各 patch の SHA-256 に加えて
+**生成された `llmlet-mod.js` / `.wasm` 自身の SHA-256** を記録する。
+
+したがって:
+
+- **docker build が失敗すると staging ごと消え、以前の成果物はそのまま残る。**
+  失敗した run が valid な provenance を書き残すことはない
+- **古い `.js` / `.wasm` と新しい `BUILD_INFO.txt` を並べても検証を通らない** —
+  artifact hash が一致しない
+- provenance だけ揃った不完全な成果物も通らない (`artifact=` 行の無い旧形式も拒否)
+
+⚠️ ビルドが途中で失敗すると `.work/llmlet` は patch が当たった状態で残る。次回 run 冒頭の
+`git reset --hard` が戻すので放置してよい (失敗の調査用にわざと残している)。
+
+`scripts/export-web-runtime.ps1` は `build/web-runtime/` へ出力する **Runtime-only export** で、
+`BUILD_INFO.txt` が pin と `patches/` に一致しない成果物を **拒否する**。patch 前の WASM を
+誤って Web 側へ渡さないための gate なので、外さないこと。
+
+```text
+build/web-runtime/
+  llmlet-mod.js
+  llmlet-mod.wasm
+  llmlet-runtime.js
+  BUILD_INFO.txt
+  SHA256SUMS.txt
+```
 
 ## Web 側から Runtime に渡すもの
 
@@ -83,6 +121,28 @@ export type RuntimePeerManager = {
 Web repo `develop` の `apps/web/src/webrtc/peerManager.ts` がこの役を持つ。
 
 DataChannel の signaling / SDP / ICE / framing / backpressure は Web 側の責務。Runtime adapter は `RTCDataChannel` を直接管理しない。
+
+### 受信バッファの所有権 — PeerManager は free しない
+
+`register_buf(fd, ptr)` は **記録のみ**に使うこと。**WASM buffer を free する callback を渡してはいけない。**
+
+pin 済み glue の実挙動:
+
+- `recv_peer()` は RPC を回している **pthread 上**で 1MiB を `malloc` し、その thread の
+  `Module._connbuf[fd]` にキャッシュする。`register_buf()` は **slot が空のときだけ**呼ばれる。
+- `_close_peer` は同じ thread で走る (`close_peer_inner` だけが main thread へ proxy される)。
+- main thread の adapter から pthread の `Module._connbuf` には**到達できない** (worker ごとに別の
+  `Module` オブジェクト)。
+
+したがって main thread から `Module.release_conn(ptr)` を呼ぶと、`_connbuf[fd]` が free 済み領域を
+指したまま残り、fd 番号が再利用された時点で use-after-free になる。Web repo の `newFd()` は
+`FD_MAX = 1024` を巡回するので、これは理論上の話ではない。
+
+解決は `patches/0001` — **buffer を確保した thread の `close_peer()` で free する**。所有権は
+WASM glue の中だけにある。
+
+- adapter の `releaseConn(ptr)` は **deprecated な no-op**。呼んでも安全だが意味は無い。
+- `releaseBuf: Module.release_conn` のように**実際に free する関数**を渡すと **double free** になる。
 
 ### Peer IDs
 
@@ -143,7 +203,43 @@ export function startRequester(options: RequesterRuntimeOptions): RequesterRunti
 export function startPeer(options: PeerRuntimeOptions): PeerRuntime
 ```
 
-これは **実装対象の契約**。ブラウザ実測が通るまでは確定済み API と扱わない。
+実装は `runtime/llmlet-runtime.js`。Node 上の lifecycle テスト (`tests/`) は通っているが、
+**real WASM / WebGPU でのブラウザ実測はまだ通していない**。確定済み API と扱わない。
+
+### 実装済みシグネチャとの差分
+
+```ts
+export type RequesterRuntime = {
+  ready: Promise<void>          // モデルロード完了 & C++ が prompt 待ちになった時点
+  generate(prompt: string): Promise<void>
+  cancel(): void
+  stop(): Promise<void>
+  releaseConn(ptr: number): void   // deprecated no-op
+}
+
+export type PeerRuntime = {
+  ready: Promise<void>
+  stop(): Promise<void>
+  releaseConn(ptr: number): void   // deprecated no-op
+}
+```
+
+共通 option として `baseUrl?: string` (既定は adapter 自身の URL) と
+`stopTimeoutMs?: number` (既定 5000) がある。
+
+### prompt のバイト長制限
+
+`get_next_prompt()` / `get_system_prompt()` は `malloc(n_ctx)` のバッファへコピーしたあと
+`buffer[min(bytes, n_ctx)]` に NUL を書くので、**ちょうど `n_ctx` バイトで 1 バイトはみ出す**。
+バイト境界で切るため multibyte 文字も割れる。
+
+adapter は `prompt` / `systemPrompt` の **UTF-8 バイト長 < n_ctx** を検証して、超えたら投げる。
+`n_ctx` は `args` の `-c` から読む (既定 4096)。
+
+### `args` の位置
+
+`options.args` は `Module.arguments` の**先頭**へ入る。`main.cpp` の parser は未知の token を
+「ここから prompt」と解釈して打ち切るので、**flag 以外を入れない**こと。
 
 ## `onToken` ではなく `onText`
 
@@ -216,6 +312,34 @@ adapter はこの性質を利用できる。
 
 同時に複数 `generate()` は受け付けない。
 
+### `cancel()` と `stop()` の違い
+
+| | generation の扱い | Runtime |
+|---|---|---|
+| `cancel()` | **resolve**。呼び出し側が短い答えを要求しただけ | 次の generation を受けられる |
+| `stop()` | **reject** (`generation was interrupted by stop()`)。出力は途中で切れている | 終了する |
+
+途中で切れた出力を「完了」として resolve すると、UI が不完全な答えを確定表示してしまう。
+
+### `generate()` に watchdog は無い
+
+peer が DataChannel を閉じずに死ぬと、RPC 呼び出しは `Atomics.wait()` の中で止まる。これは
+adapter からは観測できない。したがって:
+
+1. **呼び出し側が timeout を持つ。**
+2. timeout が発火したら Runtime の状態は不明なので、**`generate()` を再試行してはいけない**。
+3. `stop()` (失敗しても force-exit へ落ちる) を呼び、**新しい `startRequester()` を作って**
+   次の generation へ移る。
+
+### exit の解釈
+
+- **requester**: `main()` が 0 を返すのは `get_next_prompt()` が空 prompt を返したときだけで、
+  空 prompt を送るのは `stop()` 中の adapter だけ。したがって **stop を要求していない exit は、
+  code に関わらず失敗**として `onError` と `generate()` の reject に落とす。
+- **peer**: `ggml_backend_rpc_start_server` は健全なかぎり `accept_peer()` を回して戻らない。
+  一方 **backend device の初期化に失敗すると early return して main が exit 0 になる**。
+  したがって **peer の exit は常に異常**。`onError` を必ず UI / roster に繋ぐこと。
+
 ## lifecycle — まだ P0
 
 ### Requester の peer 増減
@@ -235,9 +359,81 @@ webgpu_buf_pool::cleanup()
 
 最初に試すべき最小修正は **requester が prompt 待ちのとき `pending_prompt` へ空文字を返し、C++ の chat loop を自然終了させてから新 Module を作る graceful stop**。`main.cpp` は prompt length 0 で loop を抜け `llama_free` / `llama_model_free` を通る。
 
-これを同一PCで実測してから generation 再編成へ使う。
+adapter はこれを実装済み (`stop()` → `pending_prompt` で空文字 → `main.cpp` の loop 終了 →
+`onExit(0)`)。**ブラウザ実測はまだ**。`_emscripten_force_exit(0)` への fallback も残してある
+(既定 5 秒待ってから)。
+
+`Module.onExit` がそもそも呼ばれるかは生成後の `llmlet-mod.js` で確認済み: `_proc_exit` は
+main thread で `Module["onExit"]?.(code)` を呼び、`callMain` が積んだ keepalive は
+`exitOnMainThread` が pop する。したがって main の return / force exit のどちらでも発火する。
 
 Peer server は generation ごとに再起動しない。Web 側 `PeerManager` の接続を貼り替えながら同じ RPC backend を待機させる方向を優先する。
+
+## Runtime-only harness
+
+Web 側を触らずに「Web 境界より下の Runtime が単独で正しいか」を確かめるための最小 harness。
+
+- `harness/runtime-only/` — role 切替の1ページと、BroadcastChannel 上の `RuntimePeerManager`
+- PeerJS / WebRTC / Hono を使わない。**Web repo の DataChannel wire format も複製しない**
+  (あれは SCTP の都合であって Runtime の契約ではない)
+- `releaseBuf` を持たない (上記の所有権契約どおり)
+- **fd churn を real WASM で観測できる** — `FD_MAX` を `?fdmax=` で可変にし (既定 1024、検証時は 4)、
+  connect / close / `register_buf` をログに出して **fd ごとの connection 数と registration 数 (epoch)**
+  を表示する。決定的な観測は「再利用された fd が **もう一度 register される**か」。ptr の値は見ない
+- **`send()` は 1 回で全部は受け取らない** — harness 独自の chunk 上限 (256 KiB) で受理し、
+  受理したバイト数を戻り値にする。これで巨大テンソルが 1 回の structured clone にならず、
+  `ggml-rpc.cpp` の `send_peer_retry()` の**部分送信リトライ経路も実際に通る**。
+  Web repo の 64 KiB SCTP framing とは無関係の、harness 固有の数字
+
+```bash
+pwsh -NoProfile -File scripts/build-llmlet-reference.ps1   # patch 込みで再ビルド
+pwsh -NoProfile -File scripts/export-web-runtime.ps1
+pwsh -NoProfile -File scripts/build-runtime-harness.ps1
+python scripts/serve-runtime.py build/runtime-harness --port 8888
+```
+
+| tab | URL |
+|---|---|
+| peer | `http://localhost:8888/?role=peer&id=peer-1&fdmax=4` |
+| requester | `http://localhost:8888/?role=requester&id=req-1&peers=peer-1&fdmax=4` |
+
+### 手順と合格条件
+
+1. peer タブ: 環境チェックが全部 OK (`isSecureContext` / `crossOriginIsolated` /
+   `SharedArrayBuffer` / `navigator.gpu`)、start 後に RPC server の banner がログに出る
+2. requester タブ: 小さい dense GGUF (Qwen2.5-0.5B-Instruct Q4_K_M) を File で選び start。
+   `load_tensors: layer N assigned to device RPC0` が出て `ready` が解決する
+3. 日本語 prompt を投げる → `onText` に生成文字が流れ、`generate()` が resolve する
+4. 連続 generate / 生成中 cancel / `stop()` を試し、exit code と
+   `WGPUBufferImpl::Destroy()` 例外の有無 (O9) を記録する
+5. **`patches/0001` の実測**: `fdmax=4` で generate と stop/再接続を繰り返し、
+   fd 番号が 0..3 を巡回した後に **「fd usage」表の `registrations` が `connections` に
+   追随して増える**ことを確認する。
+
+   **合格条件**: 再利用された fd (`connections >= 2`) について `registrations >= 2`。
+   events 欄では同じ fd に対する `registration #2` 以降として出る。
+
+   ⚠️ **この A/B が再現するのは「fd 再利用時に stale な `Module._connbuf[fd]` slot が残り、
+   `register_buf` が再発火しないこと」であって、use-after-free そのものの再現ではない。**
+   patch 前のバンドルでは slot が残るため `registrations` が 1 のまま止まる — 観測できるのは
+   そこまで。実際に free 済み領域へ読み書きが起きるかどうかは、PeerManager が buffer を
+   free するかどうか (Web repo の `releaseBuf`) と allocator の再利用タイミングに依存し、
+   この harness では条件を作っていない。
+
+   ⚠️ **ptr の値は合否条件にしない。** `free()` 直後の `malloc()` が同じアドレスを返すのは正常で、
+   ptr の一致/不一致は `_connbuf[fd]` が消えたかどうかを何も語らない。見るのは
+   **fd ごとの registration count (epoch)** だけ。
+
+### この harness が証明しないこと
+
+BroadcastChannel は SCTP ではない。**backpressure / MTU / mDNS / TLS / Hono signaling は一切
+試験していない。** ここが通っても Web 統合が通る証明にはならない。
+
+**use-after-free 自体も再現しない。** 手順5で見えるのは `_connbuf` slot が再利用時に
+クリアされるかどうかだけで、free 済み領域へのアクセスやメモリ破壊を観測する仕掛けは無い。
+
+自動テスト (`node --test "tests/**/*.test.mjs"`) が押さえているのは adapter の promise / error handling と
+harness PeerManager の挙動だけで、pthread・`Module._connbuf`・WebGPU は fake では再現できない。
 
 ## model source
 

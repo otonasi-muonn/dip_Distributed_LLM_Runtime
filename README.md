@@ -44,17 +44,66 @@ Pinned llmlet commit:
 730bad2f5b4d6598f55b09eb22d54b5bf2a467ed
 ```
 
+The build is **the pinned commit plus `patches/*.patch`**, not stock llmlet. The patches move
+ownership of the RPC receive buffer into the WASM glue, where the thread that allocated it can free
+it; see the buffer ownership section of [`docs/RUNTIME_INTERFACE.md`](docs/RUNTIME_INTERFACE.md).
+
 Expected artifacts:
 
 ```text
 build/reference-llmlet/
 ├─ llmlet-mod.js
-└─ llmlet-mod.wasm
+├─ llmlet-mod.wasm
+└─ BUILD_INFO.txt   pinned commits, SHA-256 of every applied patch, SHA-256 of the artifacts
 ```
+
+The build runs in a staging directory and is published only after it succeeds, and
+`BUILD_INFO.txt` is written last. A failed build therefore leaves no provenance behind and
+does not touch the previous artifacts.
 
 The checkout is stored under `.work/llmlet/`. Both `.work/` and `build/` are intentionally ignored by Git.
 
-The pinned upstream Makefile already exports the runtime methods needed by the Web bridge, including `release_conn`.
+## Export the Runtime for the Web repository
+
+```powershell
+./scripts/export-web-runtime.ps1
+```
+
+Writes `llmlet-mod.js`, `llmlet-mod.wasm`, `llmlet-runtime.js`, `BUILD_INFO.txt` and
+`SHA256SUMS.txt` into `build/web-runtime/`. This repository does not know the Web application's
+directory layout; copying the files into its static serving directory is the Web side's decision.
+
+The export **refuses artifacts whose `BUILD_INFO.txt` does not match the pinned commits, the
+current patch set, or the artifact hashes it records**. A pre-patch WASM bundle cannot be handed
+over by accident, and neither can an older `llmlet-mod.js`/`.wasm` sitting next to a newer
+`BUILD_INFO.txt`.
+
+## Runtime-only integration harness
+
+Proves the Runtime below the Web boundary without PeerJS, WebRTC or Hono: two tabs of one page,
+an injected `Module.PeerManager` over a same-origin BroadcastChannel, the real
+`llmlet-mod.js`/`.wasm`, a small dense GGUF, and one real generated answer.
+
+```powershell
+./scripts/build-runtime-harness.ps1
+```
+
+```bash
+python scripts/serve-runtime.py build/runtime-harness --port 8888
+```
+
+Open `?role=peer&id=peer-1&fdmax=4` in one tab and
+`?role=requester&id=req-1&peers=peer-1&fdmax=4` in another. Procedure and pass criteria are in
+[`docs/RUNTIME_INTERFACE.md`](docs/RUNTIME_INTERFACE.md).
+
+## Tests
+
+```bash
+node --test "tests/**/*.test.mjs"
+```
+
+Adapter lifecycle and harness transport only. They run against a fake Emscripten factory, so
+pthreads, `Module._connbuf` and WebGPU are **not** covered — those need the browser harness above.
 
 ## LAN-only reference harness
 
@@ -86,11 +135,12 @@ The harness remains useful for isolating Runtime regressions, but it is no longe
 
 ## Next executable step
 
-Implement the PeerJS-independent Runtime adapter described in [`docs/RUNTIME_INTERFACE.md`](docs/RUNTIME_INTERFACE.md):
+The PeerJS-independent adapter (`runtime/llmlet-runtime.js`) is implemented and has been reviewed
+against the pinned llmlet and llama.cpp sources, but **it has never run in a browser**.
 
-1. reuse llmlet's model / ChunkCache / prompt / lifecycle glue
-2. inject the Web repository's `Module.PeerManager` instead of calling `newPeerManager()`
-3. copy/serve the pinned `llmlet-mod.js` / `.wasm`
+1. rebuild the reference artifacts with `patches/` applied
+2. pass the Runtime-only harness in a real browser (two tabs, one prompt, real output)
+3. hand `build/web-runtime/` to the Web repository
 4. prove **Hono signaling → Web PeerManager → real WASM → one real prompt** on one machine
 5. repeat that integrated path on two physical PCs
 

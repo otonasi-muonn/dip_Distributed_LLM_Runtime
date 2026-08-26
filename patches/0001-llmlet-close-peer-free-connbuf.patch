@@ -1,0 +1,21 @@
+diff --git a/libllmlet.js b/libllmlet.js
+index 4a2dce0..e2ad308 100644
+--- a/libllmlet.js
++++ b/libllmlet.js
+@@ -165,6 +165,16 @@ mergeInto(LibraryManager.library, {
+     close_peer__proxy: 'none',
+     close_peer__sig: 'i',
+     close_peer: function(fd) {
++        // recv_peer() allocated this buffer on THIS thread and cached it in this
++        // thread's Module._connbuf, and it only calls register_buf() while the slot
++        // is empty. If the slot is not cleared here, a reused fd number keeps using
++        // the old buffer -- which the PeerManager may already have released via
++        // release_conn() -- and it is never re-registered. Free it on the thread that
++        // owns it, so nothing outside this file needs to own it.
++        if ((Module._connbuf != null) && (Module._connbuf[fd] != null)) {
++            _free(Module._connbuf[fd].buf);
++            delete Module._connbuf[fd];
++        }
+         return close_peer_inner(fd);
+     },
+ 

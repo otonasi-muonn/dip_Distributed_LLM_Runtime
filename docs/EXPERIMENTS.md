@@ -549,20 +549,21 @@ Qwen2.5-0.5B-Instruct Q4_K_M (491,400,032 bytes)、peer は WebGPU (NVIDIA Turin
 | A2 | real WASM requester + peer | **PASS**。環境チェック 6/6、`build: 8645 (c4b18b39d)` が pin と一致、`Starting RPC server v3.6.1` |
 | A3 | RPC への layer 割当 | **PASS**。`load_tensors: layer 0..24 assigned to device RPC0`、`RPC0[peer-1] compute buffer size = 298.50 MiB` |
 | A4 | 実出力 | **PASS**。`ready` 後にリセットしたバッファへ「私の名前は伊藤健太です。」等を生成 (3 セッションとも非空) |
-| A5 | graceful stop | **FAIL**。WebGPU buffer の二重破棄で abort (F42)。`stop()` は resolve し `onError` も出るが、クリーンではない |
+| A5 | graceful stop | **FAIL**。WebGPU buffer handle の lifecycle 不整合で abort (F42、double-destroy は有力仮説で未確定)。`stop()` は resolve し `onError` も出るが、クリーンではない |
 | A6 | peer 無再起動の 2 回目 | **PASS**。requester を作り直しても peer はそのままで再生成できた |
 | A7 | 安全な fdmax | **PASS**。同時 live fd は常に 1 本と実測できたので `fdmax=4` は安全。1 セッション 175 接続なので 4 で 43-44 周する |
-| A8 | fd 再利用時の cleanup | **PASS**。accepted=175 / registrations=175 / runtimeCloses=175、lag 0 (F40) |
-| A9 | 実 Chrome + WebGPU | **PASS**。環境チェック 6/6、`navigator.gpu` OK、WebGPU peer 起動、requester から実際の日本語生成成功。fd usage は **accepted=175 / registrations=175**、fd 0-3 すべて再利用。`runtimeCloses=174` は 1 本が live 中のため期待どおり |
+| A8 | fd 再利用時の cleanup | **PASS (in-app pane)**。stop 後の最終値で accepted=175 / registrations=175 / runtimeCloses=175、lag 0 (F40) |
+| A9 | 実 Chrome + WebGPU | **PASS**。環境チェック 6/6、`navigator.gpu` OK、WebGPU peer 起動、requester から実際の日本語生成成功。fd usage は **accepted=175 / registrations=175 / runtimeCloses=174 / live=1**、fd 0-3 すべて再利用。⚠️ **stop と再接続は実行していない**ので、実 Chrome での 0002 判定は **`runtimeCloses + live == accepted`** (174 + 1 = 175) で満たす |
 
 **判定**: **A5 以外はすべて PASS。**
 
 A5 は adapter ではなく **WebGPU backend の teardown 不具合** (F42) で、system としては
 復帰できている (peer 無傷・次セッション成功)。
 
-⚠️ **A9 では stop を実行していない** (A5 の既知問題のため)。したがって
-**実 Chrome における graceful stop / O9 の挙動は未計測**であり、in-app pane の結果を
-実 Chrome へそのまま外挿しない。
+⚠️ **A9 では stop も再接続も実行していない** (A5 の既知問題のため)。したがって
+**実 Chrome で計測できたのは「接続 → RPC → 実推論 → fd 再利用時の cleanup」まで**であり、
+**graceful stop / O9 / 切断 → 再接続 (A5・A6) は in-app pane の実測のみ**。
+in-app pane の結果を実 Chrome へそのまま外挿しない。
 
 ⚠️ A9 の `accepted=175` は in-app pane の測定値と一致した。**別ブラウザで同じ接続数が
 再現した**ので、F39 の「1 セッション 175 接続」はこの構成の性質であって

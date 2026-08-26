@@ -31,9 +31,14 @@ Runtime-only harness (PeerJS / WebRTC / Hono を使わず、同一 origin 2 タ�
 - requester が Qwen2.5-0.5B-Instruct Q4_K_M を **206 Range 経由**でロードし、
   `load_tensors: layer 0..24 assigned to device RPC0` で peer へ layer が乗る
 - **実際の日本語生成が完走する**
-- requester を作り直しても **peer は無再起動で次のセッションを受ける**
-- **fd 再利用時の cleanup が効く** — peer 側 4 fd で accepted=175 / registrations=175 /
-  runtimeCloses=175 (lag 0)
+- **fd 再利用時の cleanup が効く** — peer 側 4 fd で **accepted=175 / registrations=175**、
+  fd 0-3 がそれぞれ 43-44 回再利用される
+
+**in-app Browser pane でのみ確認 (実 Chrome では未実行)**
+
+- 切断 → 再接続。requester を作り直しても **peer は無再起動で次のセッションを受ける**
+- stop 後の最終値 **runtimeCloses=175 (lag 0)**。実 Chrome は stop していないため
+  **`runtimeCloses=174` + live=1** で、判定は **`runtimeCloses + live == accepted`**
 
 **未確認 — ここを「動く」と読まないこと**
 
@@ -246,7 +251,9 @@ export function startPeer(options: PeerRuntimeOptions): PeerRuntime
 ```
 
 実装は `runtime/llmlet-runtime.js`。Node 上の lifecycle テスト (`tests/`) は通っているが、
-**real WASM / WebGPU でのブラウザ実測はまだ通していない**。確定済み API と扱わない。
+**real WASM / WebGPU での実ブラウザ実測は Gate A で通した** (接続 → RPC → 実推論 →
+fd 再利用 cleanup)。ただし **Web repo の `PeerManager` を差した状態は未確認**で、
+graceful stop には既知欠陥 O9 が残るため、まだ凍結した API とは扱わない。
 
 ### 実装済みシグネチャとの差分
 
@@ -416,7 +423,14 @@ WGPUBufferImpl::Destroy()
         -> abort("Assertion failed") -> ___trap() -> RuntimeError: unreachable
 ```
 
-`~llama_context` がバッファ解放を完了したログの直後に起きる。**WebGPU buffer の二重破棄**であり、
+`~llama_context` がバッファ解放を完了したログの直後に起きる。**WebGPU buffer handle の
+lifecycle 不整合**であり、
+
+⚠️ **「二重破棄」と断定はできない。** 観測できたのは `WGPUBufferImpl::Destroy()` の時点で
+handle が `WebGPU.Internals.jsObjects` に**存在しない**ことまで。double-destroy が有力仮説だが、
+先に別経路で解放されたのか、そもそも登録されていなかったのかは切り分けていない。
+
+そのうえで、
 
 - `/restart` 固有ではない。**空 prompt による graceful stop でも起きる**
 - adapter の force-exit fallback が原因ではない。`stopTimeoutMs = 120000` にして

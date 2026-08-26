@@ -4,11 +4,14 @@
 
 Runtime 側で llmlet と llama.cpp の実コードを読んで判明した、Web アプリ側に影響する事項です。反映するかは Web 側の判断に委ねます。
 
-**前提**: 確認時点で `apps/server/src/index.ts` は Hono の Hello World スキャフォールドのままです。一方 **frontend は mock 境界を使って先行実装中**で、`apps/web/src/hooks/` に `clusterReducer.ts` / `useCluster.ts` / `useHonoSocket.mock.ts`、加えて `components/` `views/` `types/` `lib/` `config.ts` があります (`webrtc/` はまだありません)。
+**前提 (2026-08-26 更新)**: 初版執筆時は `webrtc/` がまだ無く、以下の多くは「実装前に直しておくと安い仕様書の記述」でした。**現在の `develop` (`5ef67bd`) では状況が変わっています。**
 
-つまり以下の多くは**「実装済みコードのバグ」ではなく「実装前に直しておくと安い仕様書の記述」**です。タイミングとしてはむしろ最良です。
+- `apps/web/src/webrtc/` に `peerManager.ts` / `peerSession.ts` / `requesterSession.ts` / `session.ts` が実装済み
+- `apps/web/src/hooks/usePeerManager.ts` が `createPeerManager({ releaseBuf, onError })` を組み立て済み
 
-なお frontend がここまで進んでいるぶん、**Runtime API (下記1) を早めに握る価値は上がっています** — `generate(prompt)` 相当と model source が決まらないと、mock から先へ進めないためです。
+したがって **R1 は仕様書の話ではなく現行コードに対する P0 指摘**です。それ以外の項目は初版のまま残しています。
+
+**Runtime API と model source は確定して引き渡し済みです** — [`RUNTIME_INTERFACE.md` の引き渡しサマリ](../RUNTIME_INTERFACE.md#引き渡しサマリ-2026-08-26) を参照してください。したがって下記1 (初版の指摘) はすでに解消しています。
 
 ---
 
@@ -23,17 +26,42 @@ Runtime 側で `runtime/llmlet-runtime.js` を実装し、pin 済み llmlet / ll
 (接続 → RPC → 実推論 → 切断 → 再接続 → fd 再利用 cleanup まで確認済み)。その結果、
 **Web 側でしか直せない**ものが出ました。
 
-### R1. WASM buffer を free する callback を渡さないでください (P0)
+### R1. `releaseBuf` の実装と fd 解放タイミング (P0 / 現行コード)
 
-`createPeerManager({ releaseBuf })` について。
+**現行 `develop` の該当箇所**
 
-- **禁止**: `releaseBuf: Module.release_conn` のように**実際に free する関数**を渡すこと。
-  受信バッファの所有権は WASM glue 側 (`close_peer` と同じ thread) に一本化したので、
-  **double free** になります。
+- `apps/web/src/hooks/usePeerManager.ts:57-66` — `createPeerManager({ releaseBuf: (ptr) => latest.releaseBuf?.(ptr) })` で、**WASM が来たら後から実体を差し込める配線**になっています
+  (`apps/web/src/views/PeerView.tsx:66` のコメントも「`Module.PeerManager = rpc.manager` で載せる。`releaseBuf` はそのとき一緒に渡す」)
+- `apps/web/src/webrtc/peerManager.ts:205` — `destroy()` の中で `releaseBuf?.(conn.moduleBuf)`
+- `apps/web/src/webrtc/peerManager.ts:197-198` — `destroy()` の先頭で `conns.delete(conn.fd)`
+- `apps/web/src/webrtc/peerManager.ts:293` — `handleClose()` が remote の CLOSE で即 `destroy()`
+
+**(a) `releaseBuf` に実際に free する関数を差し込まないでください**
+
+配線が空のうちは無害ですが、**予定どおり `Module.release_conn` 相当を差した瞬間に double free** になります。
+受信バッファの所有権は WASM glue 側 (`close_peer` と同じ thread) に一本化しました。
+
+- **禁止**: `releaseBuf: Module.release_conn` のように実際に free する関数
 - **安全だが不要**: adapter の `releaseConn` は deprecated な no-op なので、
-  `releaseBuf: (ptr) => runtime.releaseConn(ptr)` を渡しても壊れません。何もしないだけです。
-  次の機会に外してください。
-- `register_buf` は**記録・ログのみ**に使ってください。
+  `releaseBuf: (ptr) => runtime.releaseConn(ptr)` を渡しても壊れません。何もしないだけです
+- 一番きれいなのは **`releaseBuf` の配線ごと外すこと**。`register_buf` は**記録・ログのみ**に使ってください
+
+**(b) remote CLOSE で即 fd 番号を解放しないでください**
+
+`handleClose()` → `destroy()` → `conns.delete(conn.fd)` で、**相手から CLOSE が届いた時点で fd 番号が
+`newFd()` の再利用対象に戻ります**。しかし Runtime 側はまだその fd を持っており、後から
+`close_peer(fd)` を呼びます。その間に同じ番号が新しい接続へ配られると、**Runtime の close が
+無関係な接続を切ります**。
+
+Runtime-only harness では次の形に直し、実ブラウザで確認しました
+(`harness/runtime-only/harness-peer-manager.js`)。
+
+```text
+allocated → live → closed (tombstone: fd 番号は予約したまま。recv は即失敗、send は -1)
+                      → released (Runtime が close_connection(fd) を呼んだ時点)
+```
+
+同じ扱いを勧めます。
 
 背景: `recv_peer()` は RPC を回している pthread 上で 1MiB を malloc し、その thread の
 `Module._connbuf[fd]` にキャッシュします。`register_buf()` が呼ばれるのは **slot が空のときだけ**

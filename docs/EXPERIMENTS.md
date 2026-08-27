@@ -858,8 +858,17 @@ sched_reserve: graph splits = 2
 | `MUL_MAT_ID` 単体 × WebGPU | 455/455 数値一致 |
 | MoE × WebGPU peer | **返らない** |
 
-⇒ モデル・グラフ・RPC・adapter・カーネルの正しさはすべて否定材料にならない。
-**MoE グラフを WebGPU peer で実行する経路だけ**が残る。
+⇒ **問題領域を「WebGPU backend 固有、または WebGPU backend と実 MoE graph / RPC の
+組み合わせ」まで絞れた。**⚠️ ここから先は言えない — RPC serialization 単体は CPU peer で
+動くが、「RPC で作られた graph × WebGPU の buffer / layout / command encoding」の相互作用は
+残る。**hang / 極端な同期遅延 / 特定 op・graph 構成のどれかも未確定** (O11)。
+
+⚠️ **次の 2 つは推論であって実測ではないので、結論に使わない**:
+
+- 「単体 op が 3.4-5.1 ms なので単純な遅さではない」 — **op 単体の値から graph 全体
+  (routing / copies / 同期 / RPC / queue submit-wait) の所要時間は導けない**
+- 「GPU 5.8% なので hang でも飽和でもない」 — **同期ボトルネックでも普通に出る**し、
+  GPU が動いていることは **graph が前進している証明にならない** (同じ箇所の反復でも観測される)
 
 ### 計測時に踏んだ罠 (追加)
 

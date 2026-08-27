@@ -164,9 +164,10 @@ peer を再起動すると戻ります。**原因は未切り分け** — 観測
 upstream から backport し (`patches/0004`)、WebGPU 上で CPU 参照と 455/455 一致することまで
 確認済みです。Qwen3.6 の architecture / tokenizer / tensor 構造も pin がそのまま扱えます。
 
-**残っているのは別の問題**: 実 MoE モデルを WebGPU peer で走らせると生成が返りません (O11)。
-カーネルの正しさでも単純な遅さでも説明が付いておらず、**測定は統合GPU 1 台のみ**なので、
-まず実 peer 機で再現するか確かめる必要があります。
+**残っているのは別の問題**: 実 MoE モデルを WebGPU peer で走らせると first token に
+到達しません (O11)。**WebGPU 固有経路までは切り分け済みですが、hang / 極端な同期遅延 /
+特定 op・graph 構成のどれかは未確定**です。**測定は統合GPU 1 台のみ**なので、
+まず discrete GPU 機で再現するか確かめる必要があります。
 詳細: [QWEN36_RESULT_2026-08-28.md](QWEN36_RESULT_2026-08-28.md)
 
 ⚠️ **モデル選定に制約があります。** backport した `MUL_MAT_ID` は **IQ 系量子化に非対応**なので、

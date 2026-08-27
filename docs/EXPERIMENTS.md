@@ -795,3 +795,84 @@ pin 済み Runtime で既に動く。**残る差分は MoE = `MUL_MAT_ID` に絞
 - **harness の `auto=1` 実行中は、手動の stop / cancel ボタンがその Runtime を掴んでいない。**
   auto サイクルが握っているハンドルと画面のボタンが別物なので、auto 実行を途中で止めたいときは
   ページを離脱するしかない (そして上の peer 詰まりを起こす)。**auto=1 は最後まで走らせる前提で使う**
+
+### Gate 4 — `MUL_MAT_ID` の数値検証 (backport 後)
+
+`harness/backend-ops` で llama.cpp 自身の `tests/test-backend-ops` をブラウザ実行した。
+これは各 op を「テスト対象 backend」と「CPU backend」の両方で走らせて結果を突き合わせる
+upstream のオラクルなので、**自作の比較器を書いていない**。
+
+```text
+Backend 1/2: WebGPU
+  MUL_MAT_ID(type_a=q2_K,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=32,k=256): OK
+  MUL_MAT_ID(type_a=q3_K,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=32,k=256): OK
+  ...
+  455/455 tests passed
+  Backend WebGPU: WebGPU: OK
+Backend 2/2: CPU
+  Skipping CPU backend
+2/2 backends passed
+```
+
+- **q2_K / q3_K が含まれる** — 採用した Qwen3.6 GGUF の expert 量子化そのもの
+- `n_mats` は 32 まで、`n=1..129` を網羅
+- 非対応型 (IQ 系 / MXFP4 / NVFP4 / BF16) は `not supported [WebGPU: WebGPU]` を返す。
+  **誤った値を返すのではない**ので、`supports_op` の gate が機能していることの裏でもある
+- 反証仮説「CPU に退避して通っただけでは」: `test-backend-ops` はテスト対象 backend を
+  明示し、CPU は**参照側**として `Skipping CPU backend` になる。**否定**
+
+`perf` モードでの単体性能 (参考、最適化 commit `#22464` を意図的に外した状態):
+
+```text
+MUL_MAT_ID(type_a=f32, n_mats=128,n_used=8,b=0,m=768,n=1,k=2048): 5056 us/run - 4.98 GFLOPS
+MUL_MAT_ID(type_a=f16, ...):                                      4586 us/run - 5.49 GFLOPS
+MUL_MAT_ID(type_a=q4_0,...):                                      3398 us/run - 7.41 GFLOPS
+```
+
+### L2 — 実 MoE モデル (granite 1B-A400M) を RPC peer で
+
+| | 結果 |
+|---|---|
+| L2-a: **CPU peer** | **PASS** — `Paris` を 30 秒未満で完答。`RPC0[peer-cpu] model buffer 782.12 MiB` / CPU 39.38 MiB |
+| L2-b: **WebGPU peer** | **FAIL (O11)** — load / graph 構築 / `ready` までは通る (`graph splits = 2`、abort 無し) が、生成が 4.4 分経っても 1 トークンも出ない |
+
+L2-b で観測したこと:
+
+```text
+print_info: arch = granitemoe / n_layer = 24 / n_expert = 32 / n_expert_used = 8
+load_tensors:          CPU model buffer size =    39.38 MiB
+load_tensors: RPC0[peer] model buffer size =   782.12 MiB
+sched_reserve: RPC0[peer] compute buffer size =   146.01 MiB
+sched_reserve: graph splits = 2
+-> ready
+-> generate: 出力 0 文字のまま。peer 側の RPC コマンドは 14 件で停止し増えない。
+   requester 側 / peer 側ともエラーログ 0 件。GPU 利用率 5.8%
+```
+
+**切り分けに使った対照実験**:
+
+| 条件 | 結果 |
+|---|---|
+| MoE × CPU peer | 完走 (30 秒未満) |
+| dense × WebGPU peer (patch 後) | 完走 (Qwen3.5-0.8B / Qwen2.5-0.5B とも) |
+| `MUL_MAT_ID` 単体 × WebGPU | 455/455 数値一致 |
+| MoE × WebGPU peer | **返らない** |
+
+⇒ モデル・グラフ・RPC・adapter・カーネルの正しさはすべて否定材料にならない。
+**MoE グラフを WebGPU peer で実行する経路だけ**が残る。
+
+### 計測時に踏んだ罠 (追加)
+
+- **最初の 9 分試行は無効。** コンソールに `net::ERR_NETWORK_IO_SUSPENDED` が出ており、
+  model chunk の fetch が失敗して `Uncaught [object WebAssembly.Exception]` になっていた。
+  **マシン/ブラウザのサスペンドが原因**で、Runtime の問題ではない。
+  **長い `sleep` で待つと在席が切れる** — 短い間隔で観測して覚醒を保つこと。
+  再測定 (覚醒確認済み・両側エラー 0 件) でも同じ症状が出たので、O11 自体は環境要因だけでは
+  説明できない
+- **`test-backend-ops` の出力は ANSI 色付き。** `OK` / `FAIL` の前後にエスケープが入るので、
+  行頭・行末アンカーで判定する前に落とすこと (`harness/backend-ops/index.html` で対応済み)
+- **`docker build ... | tail` は終了コードを隠す。** 実際には失敗しているのに
+  「exit 0」に見えた。ビルドはパイプせず、`$?` を明示的に見ること
+- **`GGML_RPC=ON` で `test-backend-ops` はリンクできない。** fork は RPC のソケット層を
+  `recv_peer` などの extern に置き換えており、実体は llmlet の `libllmlet.js` にある。
+  数値検証に RPC は不要なので `GGML_RPC=OFF` にした

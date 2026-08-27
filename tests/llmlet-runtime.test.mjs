@@ -168,6 +168,20 @@ test("a second generate runs after the first, and overlapping calls are refused"
   await g2;
 });
 
+test("options.env reaches Module.ENV without dropping NO_COLOR", async () => {
+  startPeer({
+    peerManager: stubPeerManager(),
+    baseUrl: FIXTURE_BASE,
+    onLog: () => {},
+    env: { GGML_WEBGPU_TRACE: "1", DROPPED: undefined },
+  });
+  const Module = await control.waitForModule();
+
+  assert.equal(Module.ENV.NO_COLOR, "1", "the existing setting must survive");
+  assert.equal(Module.ENV.GGML_WEBGPU_TRACE, "1");
+  assert.equal("DROPPED" in Module.ENV, false, "undefined values must not become the string undefined");
+});
+
 test("cancel() stops decoding but still resolves the generation", async () => {
   const { runtime, Module, sim } = await startedRequester();
 

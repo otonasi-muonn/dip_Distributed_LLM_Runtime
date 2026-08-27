@@ -514,6 +514,12 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 
 ### Qwen3.6-35B-A3B について
 
+⚠️ **この節は 2026-08-28 の調査で古くなった。**下の「2026-08-28 Qwen3.6 対応」を先に読むこと。
+当時の見立ては「(c) upstream から cherry-pick が一見安いが、フォーク側のシェーダ埋め込み機構が
+upstream と異なる可能性が高く安く済む保証はない」だったが、**実際に調べたら (c) で通った** —
+シェーダ埋め込みは upstream と同じ `embed_wgsl.py` で、適応が要ったのは C++ の呼び出し規約1点だけ
+だった (`patches/0004`)。以下は当時の記録として残す。
+
 `DECISIONS.md` D8 の目標だが、**MoE であるため現状の WebGPU バックエンドでは動かない** (F14)。ストレッチですらなく別作業が前提になる。
 
 選択肢は3つ。(a) WGSL shader を自作、(b) フォーク全体を upstream 追随、(c) upstream から `mul_mat_id` 関連シェーダと `supports_op` の case だけ cherry-pick。(c) が一見安いが、フォーク側のシェーダ埋め込み機構が upstream と異なる可能性が高く安く済む保証はない。**いずれも3日では選べない。**
@@ -677,3 +683,115 @@ Runtime 内部の追加調査は打ち切る** ([CONSTRAINTS.md](CONSTRAINTS.md)
   provenance 検証が落ちた。`.gitattributes` の `/patches/*.patch text eol=lf` で固定した
 - `git diff --check` は `patches/*.patch` の**空 context 行の marker** を trailing whitespace として
   拾うが、これは patch の健全性の指標ではない。**patch validity は `git apply --check` で判定する**
+
+## 2026-08-28 Qwen3.6 対応 — Gate 1 / L1
+
+`docs/AI_CONTEXT.md` の P1 と `DECISIONS.md` D8 を、推測ではなく実測で動かすための一連の Gate。
+**方針は「MoE 以外を先に確定させ、差分を MoE / `MUL_MAT_ID` に絞る」。**
+
+### Gate 1 — GGUF header probe (モデルを落とさずに判定する)
+
+`scripts/probe-gguf-header.mjs` で HTTP Range によりヘッダだけ読む。13.5GB のうち約11MB。
+判定は「数MB取れた」ではなく **「header + metadata KV + tensor descriptors を完全に parse できた」**。
+
+| repo / file | arch | pre | block_count | nextn | expert 型 | `MUL_MAT_ID` 不可型 | tensor bytes |
+|---|---|---|---|---|---|---|---|
+| bartowski `Qwen_Qwen3.6-35B-A3B-Q2_K` | qwen35moe | qwen35 | **41** | **4本あり** | Q2_K/Q3_K/Q8_0 | なし | 13,495,788,032 |
+| unsloth `UD-Q2_K_XL` | qwen35moe | qwen35 | 40 | なし | IQ2_XS/IQ3_XXS/IQ4_XS | **全部不可** | 12,279,638,528 |
+| unsloth `UD-Q3_K_S` / `UD-Q3_K_M` | qwen35moe | qwen35 | 40 | なし | IQ 混在 | **不可あり** | 15.3G / 16.6G |
+| unsloth `UD-Q4_K_S` | qwen35moe | qwen35 | 40 | なし | Q4_K/Q6_K | なし | 20,882,024,960 |
+| **mradermacher `Qwen3.6-35B-A3B.Q2_K`** | qwen35moe | qwen35 | **40** | **なし** | **Q2_K/Q3_K** | **なし** | **12,928,604,672** |
+
+**採用: mradermacher の plain `Q2_K` (12.93GB)。**
+
+決め手:
+
+- `tokenizer.ggml.pre = qwen35` — pin の `llama-vocab.cpp:1972` が認識する。未知値は `throw` (`:2107`) なのでここは通るか落ちるかの二択だった
+- `block_count = 40` — pin の `llama-model.cpp` の `case 40: LLM_TYPE_35B_A3B` に一致
+- **nextn tensor が無い** — bartowski 版は `block_count=41` (40実層 + MTP層) で `blk.40.nextn.*` を4本持つ。
+  pin の `qwen35moe` は `nextn_predict_layers` を読まず、しかも `is_recurrent(40)` が true になるので
+  存在しない `blk.40.ssm_*` を必須テンソルとして要求する。**MTP 無しの版を選ぶことで、MTP 対応の
+  backport が丸ごと不要になった**
+- expert が Q2_K/Q3_K のみ — backport する `MUL_MAT_ID` は **IQ 系を持たない**ので、unsloth の UD 量子化は
+  expert が IQ になり使えない。K 量子化のみで最小なのがこの版
+- BF16 も消える — bartowski 版の BF16 2本は `blk.40` (MTP層) の `ffn_gate_inp` だけだった
+
+構造の一致は目視ではなく機械的に確認した。pin の `load_tensors` が `qwen35moe` で作るテンソルを
+`is_recurrent(i) = ((i+1) % 4 != 0)` ごとに列挙して突き合わせた結果:
+
+```text
+layers=40 recurrent=30 full_attention=10
+global tensors: output.weight, output_norm.weight, token_embd.weight
+tensors in file = 733
+tensors the pinned loader creates = 733
+STRUCTURE MATCHES the pinned qwen35moe loader
+```
+
+欠落も余剰も 0。したがって `done_getting_tensors()` の `wrong number of tensors` は起きない。
+
+byte accounting も閉じている: `12,928,604,672 (tensor) + 10,989,536 (dataStart) = 12,939,594,208` = ファイルサイズ。
+**Gate 6D はこの値と各 backend の buffer 合計を突き合わせる。生ファイルサイズとの一致は求めない。**
+
+### L1 — 未改造 Runtime で `qwen35` dense (Gated DeltaNet) を通す
+
+**パッチを1行も当てない状態**で `ggml-org/Qwen3.5-0.8B-GGUF` Q4_0 を Runtime-only harness に通した。
+`qwen35` は `qwen35moe` と同じ `llm_build_delta_net_base` を使うので、**Qwen3.6 の「MoE 以外」を
+先に確定させる**のが狙い。
+
+| | 結果 |
+|---|---|
+| L1-a (1 peer) | **PASS** — `<think>` を閉じて `Paris` を出力、EOS で完走 |
+| L1-b (2 peer) | **PASS** — 同上。層が 2 peer へ分散 |
+| L1-c (GDN 経路) | **PASS** — `fused Gated Delta Net (autoregressive) enabled` / `(chunked) enabled` |
+
+証拠 (L1-a):
+
+```text
+print_info: arch = qwen35 / n_layer = 24 / model type = 0.8B / model params = 752.39 M
+using device RPC0 (peer-1) (unknown id) - 2048 MiB free
+load_tensors:          CPU model buffer size =   257.66 MiB
+load_tensors: RPC0[peer-1] model buffer size =   526.51 MiB
+sched_reserve: RPC0[peer-1] compute buffer size =   487.00 MiB
+sched_reserve:        CPU compute buffer size =    14.02 MiB
+sched_reserve: graph splits = 2
+sched_reserve: fused Gated Delta Net (autoregressive) enabled
+sched_reserve: fused Gated Delta Net (chunked) enabled
+```
+
+反証仮説「requester のローカルで計算していただけでは」への回答:
+CPU 側は **257.66 MiB = `token_embd.weight` (Q8_0, F21 で必ず CPU に固定される) のみ**、
+compute buffer も CPU 14.02 MiB に対し peer 487.00 MiB。`ssm_*` テンソルは **126本** ロードされており、
+これは 24層中の recurrent 18層 × 7本と一致する。
+
+証拠 (L1-b, 2 peer):
+
+```text
+using device RPC0 (peer-1) - 2048 MiB free
+using device RPC1 (peer-2) - 2048 MiB free
+load_tensors: RPC0[peer-1] model buffer size =   146.07 MiB
+load_tensors: RPC0[peer-2] model buffer size =   380.43 MiB
+sched_reserve: graph splits = 3
+```
+
+反証仮説「片方の peer に全部乗っていないか」: 146.07 + 380.43 = 526.50 MiB で全層分。
+**偏ってはいるが分散はしている。**偏りは O7 の既知挙動 (両 peer とも `2048 MiB free` と申告し、
+出力テンソルが最終デバイスに乗る) と整合する。
+
+**したがって Qwen3.6 の Gated DeltaNet / hybrid recurrent / IMRoPE / gated attention は、
+pin 済み Runtime で既に動く。**残る差分は MoE = `MUL_MAT_ID` に絞られた。
+
+### この過程で分かった Runtime 以外の性質
+
+- **`main.cpp` には生成長の上限が無い** (`-n` / `n_predict` を parse していない)。EOS まで走るので、
+  thinking モデルが自己修正ループに入ると harness の timeout まで止まらない。実際
+  「Reply with one short sentence.」で 12,000 文字を超えるループになった。同じモデルでも
+  「What is the capital of France? Reply with only the city name.」なら 1 回で終わる。
+  **Gate 6G のプロンプトは終端しやすいものを選ぶ**
+- **生成中に requester のページを離脱すると peer が塞がる。** peer 側 `fdstats` は
+  旧 requester の fd が `live` のまま残り (`accepted=6 registrations=6 runtimeCloses=5`)、
+  次の requester は接続できずロードが進まない。F8 (1サーバ1クライアント、`rpc_serve_client` は
+  ブロッキング) の帰結。**peer を再起動すれば戻る。**Web 統合フェーズで
+  「requester がクラッシュ/離脱したときに peer をどう解放するか」は設計項目になる
+- **harness の `auto=1` 実行中は、手動の stop / cancel ボタンがその Runtime を掴んでいない。**
+  auto サイクルが握っているハンドルと画面のボタンが別物なので、auto 実行を途中で止めたいときは
+  ページを離脱するしかない (そして上の peer 詰まりを起こす)。**auto=1 は最後まで走らせる前提で使う**

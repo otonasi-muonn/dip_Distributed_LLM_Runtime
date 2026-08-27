@@ -24,6 +24,13 @@
   <code>patches/0004</code>.
 </p>
 
+<p class="note">
+  <strong>The verdict below is computed here, not taken from the program.</strong> Its own
+  <code>n/n tests passed</code> line and its exit status count only the cases it ran -
+  <code>NOT_SUPPORTED</code> and <code>SKIPPED</code> are skipped before the counter, so a run
+  that executed nothing still prints <code>0/0 tests passed</code> and exits 0.
+</p>
+
 <div class="env" id="env"></div>
 
 <div class="row">
@@ -63,32 +70,84 @@ const append = (text) => {
   el("out").scrollTop = el("out").scrollHeight;
 };
 
+const ANSI = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
+
 /**
- * test-backend-ops prints one line per case and a per-backend verdict. What matters for a
- * gate is the verdict and the failures, so pull those out rather than making a human scan
- * the log. "not supported" is counted separately: it means the backend declined the case,
- * which is a different outcome from computing it wrongly.
+ * Decide the verdict here rather than trusting what test-backend-ops prints.
+ *
+ * Its "n/n tests passed" line, and its exit status, count only the cases it actually ran:
+ * NOT_SUPPORTED and SKIPPED hit a `continue` before tests_run++
+ * (test-backend-ops.cpp:9121-9136). A run where the backend declined every case still
+ * prints "0/0 tests passed" and exits 0. Reading that as a pass is how you end up calling
+ * a model supported when nothing was executed.
+ *
+ * So the verdict requires FAIL == 0 *and* NOT_SUPPORTED == 0, counted from the per-case
+ * lines rather than from the program's own total.
  */
 function summarise(all) {
-  // test-backend-ops colours its verdicts, and the escape sequences land between the
-  // words the patterns below look for, so strip them before matching.
-  const text = all.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+  // test-backend-ops colours its verdicts, and the escape sequences land between the words
+  // the patterns below look for, so strip them before matching.
+  const text = all.join("\n").replace(ANSI, "");
   const backends = [...text.matchAll(/^Backend (\d+)\/(\d+): (.+)$/gm)].map((m) => m[3]);
-  const verdicts = [...text.matchAll(/^Backend (\S+): (OK|FAIL)$/gm)].map((m) => `${m[1]}: ${m[2]}`);
-  const failed = [...text.matchAll(/^.*\bFAIL\b.*$/gm)].map((m) => m[0]);
-  const notSupported = (text.match(/not supported/g) || []).length;
-  const ok = (text.match(/\bOK\b/g) || []).length;
-  const totals = [...text.matchAll(/^\d+\/\d+ tests passed$/gm)].map((m) => m[0]);
+  const selfReported = [...text.matchAll(/^\s*\d+\/\d+ tests passed$/gm)].map((m) => m[0].trim());
+
+  // One line per case: "  OP(params): OK" / ": FAIL" / ": not supported [backend]".
+  const caseLines = [...text.matchAll(/^ {2}\S+\(.*\): (.+)$/gm)];
+  const okCases = caseLines.filter((m) => /^OK\b/.test(m[1].trim()));
+  const failCases = caseLines.filter((m) => /\bFAIL\b/.test(m[1]));
+  const notSupported = caseLines.filter((m) => /not supported/.test(m[1]));
+  const other = caseLines.length - okCases.length - failCases.length - notSupported.length;
+
+  const pass = caseLines.length > 0 && failCases.length === 0 && notSupported.length === 0;
+  const verdict = caseLines.length === 0
+    ? "NO CASES RAN - nothing was verified"
+    : pass
+      ? "PASS - every case ran on the backend under test and matched the CPU reference"
+      : `NOT A PASS - ${failCases.length} FAIL, ${notSupported.length} NOT SUPPORTED`;
 
   return [
+    `VERDICT            : ${verdict}`,
+    "",
     `backends seen      : ${backends.join(", ") || "(none)"}`,
-    `per-backend verdict: ${verdicts.join(" | ") || "(none yet)"}`,
-    `totals             : ${totals.join(" | ") || "(none yet)"}`,
-    `OK markers         : ${ok}`,
-    `not supported      : ${notSupported}`,
-    `FAIL lines         : ${failed.length}`,
-    ...failed.slice(0, 40).map((l) => `  ${l}`),
+    `cases seen         : ${caseLines.length}`,
+    `  OK               : ${okCases.length}`,
+    `  FAIL             : ${failCases.length}`,
+    `  NOT SUPPORTED    : ${notSupported.length}`,
+    ...(other > 0 ? [`  unclassified     : ${other}`] : []),
+    "",
+    `self-reported      : ${selfReported.join(" | ") || "(none)"}`,
+    "  ^ counts executed cases only; NOT SUPPORTED is excluded, so this line and the",
+    "    exit status cannot decide a pass on their own.",
+    ...(failCases.length > 0
+      ? ["", "FAIL cases:", ...failCases.slice(0, 40).map((m) => `  ${m[0].trim()}`)]
+      : []),
+    ...(notSupported.length > 0
+      ? ["", "NOT SUPPORTED cases:", ...notSupported.slice(0, 40).map((m) => `  ${m[0].trim()}`)]
+      : []),
   ].join("\n");
+}
+
+const setVerdict = (summary) => {
+  el("summary").textContent = summary;
+  const failed = summary.startsWith("VERDICT            : PASS") ? false : true;
+  el("summary").style.color = failed ? "#c00" : "#0a0";
+};
+
+/**
+ * Cases can be supplied from a file produced by llama-export-graph-ops, which carries the
+ * real shapes, strides and op_params of an actual model graph. The file is fetched and
+ * written into MEMFS before main() runs, so `--test-file <path>` can find it.
+ */
+async function preloadTestFile(argv) {
+  const at = argv.indexOf("--test-file");
+  if (at < 0 || at + 1 >= argv.length) return undefined;
+  const target = argv[at + 1];
+  const name = target.replace(/^\/+/, "");
+  const response = await fetch(`./${name}`);
+  if (!response.ok) throw new Error(`could not fetch ${name}: HTTP ${response.status}`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  append(`test file: ${name} (${bytes.length} bytes)`);
+  return { target, bytes };
 }
 
 el("run").addEventListener("click", async () => {
@@ -97,26 +156,35 @@ el("run").addEventListener("click", async () => {
   lines.length = 0;
   el("out").textContent = "";
   el("summary").textContent = "(running)";
+  el("summary").style.color = "";
 
   const argv = el("args").value.trim().split(/\s+/).filter(Boolean);
   append(`argv: ${argv.join(" ")}`);
 
   try {
+    const testFile = await preloadTestFile(argv);
     const factory = (await import("./test-backend-ops.js")).default;
     await factory({
       arguments: argv,
       print: append,
       printErr: append,
+      preRun: testFile
+        ? [(mod) => {
+            const dir = testFile.target.slice(0, testFile.target.lastIndexOf("/"));
+            if (dir) mod.FS.mkdirTree(dir);
+            mod.FS.writeFile(testFile.target, testFile.bytes);
+          }]
+        : undefined,
       onExit: (code) => {
         el("status").innerHTML = code === 0
           ? '<span class="ok">exit 0</span>'
           : `<span class="bad">exit ${code}</span>`;
-        el("summary").textContent = summarise(lines);
+        setVerdict(summarise(lines));
         el("run").disabled = false;
       },
       onAbort: (what) => {
         el("status").innerHTML = `<span class="bad">aborted: ${what}</span>`;
-        el("summary").textContent = summarise(lines);
+        setVerdict(summarise(lines));
         el("run").disabled = false;
       },
     });

@@ -1,0 +1,131 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>test-backend-ops harness</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; max-width: 1100px; }
+  h1 { font-size: 1.1rem; }
+  .note { color: #555; max-width: 70ch; }
+  .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin: .75rem 0; }
+  input[type=text] { font: inherit; padding: .2rem .35rem; }
+  button { font: inherit; padding: .25rem .8rem; }
+  pre { background: #f5f5f5; padding: .6rem; overflow: auto; max-height: 46vh; white-space: pre-wrap; }
+  .ok { color: #0a0; font-weight: bold; }
+  .bad { color: #c00; font-weight: bold; }
+  .env span { margin-right: 1rem; }
+</style>
+
+<h1>test-backend-ops harness</h1>
+
+<p class="note">
+  Runs llama.cpp's own <code>tests/test-backend-ops</code> in this browser. It executes each op
+  on every registered backend and on the CPU backend in the same process, and compares the
+  results, so a pass here is a numerical claim about the WebGPU kernels, not just evidence that
+  they were reachable. Default filter is <code>MUL_MAT_ID</code>, the MoE expert FFN added by
+  <code>patches/0004</code>.
+</p>
+
+<div class="env" id="env"></div>
+
+<div class="row">
+  <label>args <input type="text" id="args" size="46" value="-o MUL_MAT_ID"></label>
+  <button id="run">run</button>
+  <span id="status"></span>
+</div>
+
+<h2>Summary</h2>
+<pre id="summary">(not run)</pre>
+
+<h2>Output</h2>
+<pre id="out"></pre>
+
+<script type="module">
+const el = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+
+const checks = [
+  ["window.isSecureContext", window.isSecureContext === true],
+  ["crossOriginIsolated", window.crossOriginIsolated === true],
+  ["SharedArrayBuffer", typeof SharedArrayBuffer === "function"],
+  ["navigator.gpu", Boolean(navigator.gpu)],
+];
+el("env").innerHTML = checks
+  .map(([name, ok]) => `<span class="${ok ? "ok" : "bad"}">${ok ? "OK" : "NG"} ${name}</span>`)
+  .join("");
+
+if (params.get("args")) el("args").value = params.get("args");
+
+const lines = [];
+const append = (text) => {
+  lines.push(text);
+  // The full run prints thousands of cases; keep the tail bounded so the page stays usable.
+  if (lines.length > 4000) lines.splice(0, lines.length - 4000);
+  el("out").textContent = lines.join("\n");
+  el("out").scrollTop = el("out").scrollHeight;
+};
+
+/**
+ * test-backend-ops prints one line per case and a per-backend verdict. What matters for a
+ * gate is the verdict and the failures, so pull those out rather than making a human scan
+ * the log. "not supported" is counted separately: it means the backend declined the case,
+ * which is a different outcome from computing it wrongly.
+ */
+function summarise(all) {
+  // test-backend-ops colours its verdicts, and the escape sequences land between the
+  // words the patterns below look for, so strip them before matching.
+  const text = all.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+  const backends = [...text.matchAll(/^Backend (\d+)\/(\d+): (.+)$/gm)].map((m) => m[3]);
+  const verdicts = [...text.matchAll(/^Backend (\S+): (OK|FAIL)$/gm)].map((m) => `${m[1]}: ${m[2]}`);
+  const failed = [...text.matchAll(/^.*\bFAIL\b.*$/gm)].map((m) => m[0]);
+  const notSupported = (text.match(/not supported/g) || []).length;
+  const ok = (text.match(/\bOK\b/g) || []).length;
+  const totals = [...text.matchAll(/^\d+\/\d+ tests passed$/gm)].map((m) => m[0]);
+
+  return [
+    `backends seen      : ${backends.join(", ") || "(none)"}`,
+    `per-backend verdict: ${verdicts.join(" | ") || "(none yet)"}`,
+    `totals             : ${totals.join(" | ") || "(none yet)"}`,
+    `OK markers         : ${ok}`,
+    `not supported      : ${notSupported}`,
+    `FAIL lines         : ${failed.length}`,
+    ...failed.slice(0, 40).map((l) => `  ${l}`),
+  ].join("\n");
+}
+
+el("run").addEventListener("click", async () => {
+  el("run").disabled = true;
+  el("status").textContent = "running...";
+  lines.length = 0;
+  el("out").textContent = "";
+  el("summary").textContent = "(running)";
+
+  const argv = el("args").value.trim().split(/\s+/).filter(Boolean);
+  append(`argv: ${argv.join(" ")}`);
+
+  try {
+    const factory = (await import("./test-backend-ops.js")).default;
+    await factory({
+      arguments: argv,
+      print: append,
+      printErr: append,
+      onExit: (code) => {
+        el("status").innerHTML = code === 0
+          ? '<span class="ok">exit 0</span>'
+          : `<span class="bad">exit ${code}</span>`;
+        el("summary").textContent = summarise(lines);
+        el("run").disabled = false;
+      },
+      onAbort: (what) => {
+        el("status").innerHTML = `<span class="bad">aborted: ${what}</span>`;
+        el("summary").textContent = summarise(lines);
+        el("run").disabled = false;
+      },
+    });
+  } catch (error) {
+    append(`harness error: ${error?.message ?? error}`);
+    el("status").innerHTML = '<span class="bad">harness error</span>';
+    el("run").disabled = false;
+  }
+});
+
+if (params.get("auto") === "1") el("run").click();
+</script>

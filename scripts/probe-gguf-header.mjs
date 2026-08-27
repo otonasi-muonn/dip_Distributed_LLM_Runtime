@@ -333,6 +333,16 @@ async function main() {
         overshootIntoTensorData: Math.max(0, s.bytesFetched - header.dataStart),
         requests: s.requests,
         dataStart: header.dataStart,
+        // Everything above is this reader's own summary. The two fields below are
+        // the raw material an independent reader can be diffed against, which is
+        // what scripts/crosscheck-gguf-probe.mjs does - a parser whose only check
+        // is its own tests is a parser nobody has checked.
+        tensors: tensorLimit > 0 ? header.tensors : undefined,
+        arrayFields: Object.fromEntries(
+          [...header.metadata]
+            .filter(([, entry]) => entry.kind === "array")
+            .map(([key, entry]) => [key, { itemType: entry.itemType, length: entry.length, sample: entry.sample }]),
+        ),
       }, jsonReplacer, 2));
     } else {
       console.log(`# ${target}`);

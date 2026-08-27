@@ -885,3 +885,64 @@ sched_reserve: graph splits = 2
 - **`GGML_RPC=ON` で `test-backend-ops` はリンクできない。** fork は RPC のソケット層を
   `recv_peer` などの extern に置き換えており、実体は llmlet の `libllmlet.js` にある。
   数値検証に RPC は不要なので `GGML_RPC=OFF` にした
+
+## 2026-08-28 判定器を fail-closed にした (Part A)
+
+Qwen3.6 の実形状 op を検証する前に、**判定器そのもの**を直した。敵対的レビューで
+穴が 2 回続けて見つかったため、今回は
+**「悪い結果を拾えるか」だけでなく「何件検証するはずだったか / 実際に何件判定したか」**
+を合格条件に入れた。
+
+### 塞いだ穴
+
+| # | 穴 | なぜ通ってしまうか |
+|---|---|---|
+| 1 | 表示用に 4000 行で truncate している配列を判定にも使っていた | 長い run の前半に出た `FAIL` / `NOT_SUPPORTED` が捨てられた後で判定が走る |
+| 2 | `unclassified` を計算しながら合否に入れていない。`SKIPPED` は分類すらしていない | `SKIPPED` は `NOT_SUPPORTED` と同じく `tests_run` から除外される側 (F52) |
+| 3 | 出力されたケース行しか数えていない | **そもそも出力されなかったケース**が見えない (500 件中 450 件が出て全部 OK → PASS) |
+| 4 | backend を名前で集約していた | `WebGPU: GPU-A` 250 + `WebGPU: GPU-B` 250 = 500 = EXPECTED → PASS |
+
+### 現在の合格条件
+
+```text
+PASS =
+    target (WebGPU) section がちょうど 1 つ
+ && EXPECTED > 0                       (= --test-file の非空行数)
+ && OBSERVED == EXPECTED               (OBSERVED = OK+FAIL+NOT_SUPPORTED+SKIPPED+UNKNOWN)
+ && OK       == EXPECTED
+ && FAIL == 0 && NOT_SUPPORTED == 0 && SKIPPED == 0 && UNKNOWN == 0
+```
+
+`--test-file` を使わない実行では EXPECTED が不明なので、
+**compatibility gate の PASS としては扱わない**と明示する。
+
+`EXPECTED` を入力から取れるのは、`export-graph-ops` が 1 `test_object` の serialize 末尾に
+`out << '
+'` を書き、`make_test_cases_from_file` が `std::getline` で 1 行 1 ケースとして
+読むため (F53)。
+
+### 実測 — 旧判定器なら PASS にしていた run
+
+この機で `-o MUL_MAT_ID -p n_mats=4` を実行した結果:
+
+```text
+self-reported : 232/232 tests passed        (exit 0)
+実際          : 358 cases / OK 232 / NOT SUPPORTED 126 / FAIL 0
+VERDICT       : NOT A PASS
+                - expected case count is unknown (no --test-file)
+target section: 1/2 WebGPU
+all sections  : 1/2 WebGPU (358) | 2/2 CPU (0)
+```
+
+**プログラム自身は `232/232 tests passed` かつ `exit 0` を報告しているのに、
+126 件は実行を拒否されている。** F52 がそのまま観測できた形。
+新しい判定器は `NOT A PASS` を出し、理由を名指しし、CPU section の 0 件を
+target に混ぜていない。
+
+### 判定器の単体テスト
+
+`tests/backend-ops-summary.test.mjs` (18 本)。上の穴 1-4 それぞれに回帰テストがあり、
+加えて **chunk 安全性** (1 ケースを 2 callback に分割 / 2 ケースを 1 callback /
+`
+` / 末尾改行なし + `flush()`) を固定している。**判定器を UI callback の
+偶然の仕様に依存させない**ため。

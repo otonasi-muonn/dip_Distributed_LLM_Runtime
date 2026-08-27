@@ -95,6 +95,11 @@ try {
     # `build/` is excluded because a developer may have built outside Docker into
     # it; the Docker build does not need it (the Dockerfile compiles in the
     # container, into /work/build) and nothing here reads it.
+    #
+    # This does mean any untracked file placed by hand under .work/llmlet - a
+    # scratch debug edit, a stray log - is deleted on the next build. That
+    # checkout is a disposable, reproducible artifact of the pin plus patches/,
+    # not somewhere to keep work.
     git clean -ffdq -e build
     Assert-LastExitCode "git clean"
 

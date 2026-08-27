@@ -73,7 +73,6 @@ try {
     Assert-LastExitCode "git fetch origin"
 
     # Drop patches applied by a previous run so the build always starts from the pin.
-    # git clean is deliberately not used: it would delete local build output.
     git reset --hard
     Assert-LastExitCode "git reset --hard"
 
@@ -88,6 +87,19 @@ try {
 
     git submodule foreach --recursive git reset --hard
     Assert-LastExitCode "git submodule reset"
+
+    # A patch that adds files (patches/0004 adds two .wgsl shaders) leaves them
+    # behind after `git reset --hard`, and the next run then fails to apply it
+    # because the files already exist. Untracked files have to go too.
+    #
+    # `build/` is excluded because a developer may have built outside Docker into
+    # it; the Docker build does not need it (the Dockerfile compiles in the
+    # container, into /work/build) and nothing here reads it.
+    git clean -ffdq -e build
+    Assert-LastExitCode "git clean"
+
+    git submodule foreach --recursive git clean -ffdq -e build
+    Assert-LastExitCode "git submodule clean"
 
     $ActualCommit = (git rev-parse HEAD).Trim()
     Assert-LastExitCode "git rev-parse HEAD"

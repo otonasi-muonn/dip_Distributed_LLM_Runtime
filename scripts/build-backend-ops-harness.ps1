@@ -78,7 +78,10 @@ try {
         }
     }
 
-    foreach ($File in (Get-ChildItem -Path $ResolvedHarnessDir -File -Filter "*.html")) {
+    # The page and the verdict module. summary.mjs is what decides pass/fail, and it is
+    # shared with tests/backend-ops-summary.test.mjs so the judge the browser runs is the
+    # judge that is under test.
+    foreach ($File in (Get-ChildItem -Path $ResolvedHarnessDir -File -Include "*.html", "*.mjs" -Recurse -Depth 0)) {
         Copy-Item -Force $File.FullName (Join-Path $StagingDir $File.Name)
     }
 
@@ -99,7 +102,9 @@ Write-Host ""
 Write-Host "  python scripts/serve-runtime.py $OutputDir --port 8889"
 Write-Host ""
 Write-Host "  MUL_MAT_ID only  http://localhost:8889/?args=-o%20MUL_MAT_ID"
-Write-Host "  everything       http://localhost:8889/"
+Write-Host "  a model's ops    http://localhost:8889/?args=--test-file%20/<name>-ops.txt"
 Write-Host ""
-Write-Host "A pass means the backend under test matched the CPU reference. Check the"
-Write-Host "'Backend n/N' line in the output to confirm WebGPU was one of them."
+Write-Host "The page computes the verdict; do not read the program's own 'n/n tests passed'"
+Write-Host "or its exit status as one, since neither counts the cases it declined to run."
+Write-Host "A pass needs one WebGPU section, the expected number of cases to have run there,"
+Write-Host "and every one of them OK. --test-file is what supplies that expected number."

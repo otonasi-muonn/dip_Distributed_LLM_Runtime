@@ -4,11 +4,13 @@
 <style>
   body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; max-width: 1100px; }
   h1 { font-size: 1.1rem; }
-  .note { color: #555; max-width: 70ch; }
+  .note { color: #555; max-width: 74ch; }
   .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin: .75rem 0; }
   input[type=text] { font: inherit; padding: .2rem .35rem; }
   button { font: inherit; padding: .25rem .8rem; }
   pre { background: #f5f5f5; padding: .6rem; overflow: auto; max-height: 46vh; white-space: pre-wrap; }
+  #summary.pass { color: #0a0; }
+  #summary.bad { color: #c00; }
   .ok { color: #0a0; font-weight: bold; }
   .bad { color: #c00; font-weight: bold; }
   .env span { margin-right: 1rem; }
@@ -18,34 +20,38 @@
 
 <p class="note">
   Runs llama.cpp's own <code>tests/test-backend-ops</code> in this browser. It executes each op
-  on every registered backend and on the CPU backend in the same process, and compares the
-  results, so a pass here is a numerical claim about the WebGPU kernels, not just evidence that
-  they were reachable. Default filter is <code>MUL_MAT_ID</code>, the MoE expert FFN added by
-  <code>patches/0004</code>.
+  on the backend under test and on the CPU backend in the same process and compares the
+  results, so a pass here is a numerical claim about the WebGPU kernels, not just evidence
+  that they were reachable.
 </p>
 
 <p class="note">
-  <strong>The verdict below is computed here, not taken from the program.</strong> Its own
+  <strong>The verdict is computed here, not taken from the program.</strong> Its
   <code>n/n tests passed</code> line and its exit status count only the cases it ran -
-  <code>NOT_SUPPORTED</code> and <code>SKIPPED</code> are skipped before the counter, so a run
-  that executed nothing still prints <code>0/0 tests passed</code> and exits 0.
+  <code>NOT_SUPPORTED</code> and <code>SKIPPED</code> are skipped before the counter - so a run
+  that executed nothing still prints <code>0/0 tests passed</code> and exits 0. A pass here
+  needs the expected number of cases to have run on one WebGPU section and all of them to be
+  <code>OK</code>. Pass <code>--test-file</code> to supply that expected number; without it,
+  completeness cannot be claimed.
 </p>
 
 <div class="env" id="env"></div>
 
 <div class="row">
-  <label>args <input type="text" id="args" size="46" value="-o MUL_MAT_ID"></label>
+  <label>args <input type="text" id="args" size="52" value="-o MUL_MAT_ID"></label>
   <button id="run">run</button>
   <span id="status"></span>
 </div>
 
-<h2>Summary</h2>
+<h2>Verdict</h2>
 <pre id="summary">(not run)</pre>
 
 <h2>Output</h2>
 <pre id="out"></pre>
 
 <script type="module">
+import { BackendOpsSummary, countExpectedCases } from "./summary.mjs";
+
 const el = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 
@@ -61,113 +67,66 @@ el("env").innerHTML = checks
 
 if (params.get("args")) el("args").value = params.get("args");
 
-const lines = [];
-const append = (text) => {
-  lines.push(text);
-  // The full run prints thousands of cases; keep the tail bounded so the page stays usable.
-  if (lines.length > 4000) lines.splice(0, lines.length - 4000);
-  el("out").textContent = lines.join("\n");
+// Scrollback for a human. Bounded on purpose - and deliberately NOT what the verdict
+// reads, because a truncated log would quietly drop failures from the count.
+const shown = [];
+const show = (text) => {
+  shown.push(text);
+  if (shown.length > 4000) shown.splice(0, shown.length - 4000);
+  el("out").textContent = shown.join("\n");
   el("out").scrollTop = el("out").scrollHeight;
 };
 
-const ANSI = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
-
-/**
- * Decide the verdict here rather than trusting what test-backend-ops prints.
- *
- * Its "n/n tests passed" line, and its exit status, count only the cases it actually ran:
- * NOT_SUPPORTED and SKIPPED hit a `continue` before tests_run++
- * (test-backend-ops.cpp:9121-9136). A run where the backend declined every case still
- * prints "0/0 tests passed" and exits 0. Reading that as a pass is how you end up calling
- * a model supported when nothing was executed.
- *
- * So the verdict requires FAIL == 0 *and* NOT_SUPPORTED == 0, counted from the per-case
- * lines rather than from the program's own total.
- */
-function summarise(all) {
-  // test-backend-ops colours its verdicts, and the escape sequences land between the words
-  // the patterns below look for, so strip them before matching.
-  const text = all.join("\n").replace(ANSI, "");
-  const backends = [...text.matchAll(/^Backend (\d+)\/(\d+): (.+)$/gm)].map((m) => m[3]);
-  const selfReported = [...text.matchAll(/^\s*\d+\/\d+ tests passed$/gm)].map((m) => m[0].trim());
-
-  // One line per case: "  OP(params): OK" / ": FAIL" / ": not supported [backend]".
-  const caseLines = [...text.matchAll(/^ {2}\S+\(.*\): (.+)$/gm)];
-  const okCases = caseLines.filter((m) => /^OK\b/.test(m[1].trim()));
-  const failCases = caseLines.filter((m) => /\bFAIL\b/.test(m[1]));
-  const notSupported = caseLines.filter((m) => /not supported/.test(m[1]));
-  const other = caseLines.length - okCases.length - failCases.length - notSupported.length;
-
-  const pass = caseLines.length > 0 && failCases.length === 0 && notSupported.length === 0;
-  const verdict = caseLines.length === 0
-    ? "NO CASES RAN - nothing was verified"
-    : pass
-      ? "PASS - every case ran on the backend under test and matched the CPU reference"
-      : `NOT A PASS - ${failCases.length} FAIL, ${notSupported.length} NOT SUPPORTED`;
-
-  return [
-    `VERDICT            : ${verdict}`,
-    "",
-    `backends seen      : ${backends.join(", ") || "(none)"}`,
-    `cases seen         : ${caseLines.length}`,
-    `  OK               : ${okCases.length}`,
-    `  FAIL             : ${failCases.length}`,
-    `  NOT SUPPORTED    : ${notSupported.length}`,
-    ...(other > 0 ? [`  unclassified     : ${other}`] : []),
-    "",
-    `self-reported      : ${selfReported.join(" | ") || "(none)"}`,
-    "  ^ counts executed cases only; NOT SUPPORTED is excluded, so this line and the",
-    "    exit status cannot decide a pass on their own.",
-    ...(failCases.length > 0
-      ? ["", "FAIL cases:", ...failCases.slice(0, 40).map((m) => `  ${m[0].trim()}`)]
-      : []),
-    ...(notSupported.length > 0
-      ? ["", "NOT SUPPORTED cases:", ...notSupported.slice(0, 40).map((m) => `  ${m[0].trim()}`)]
-      : []),
-  ].join("\n");
-}
-
 const setVerdict = (summary) => {
-  el("summary").textContent = summary;
-  const failed = summary.startsWith("VERDICT            : PASS") ? false : true;
-  el("summary").style.color = failed ? "#c00" : "#0a0";
+  summary.flush();
+  el("summary").textContent = summary.format();
+  el("summary").className = summary.verdict().pass ? "pass" : "bad";
 };
 
 /**
- * Cases can be supplied from a file produced by llama-export-graph-ops, which carries the
- * real shapes, strides and op_params of an actual model graph. The file is fetched and
- * written into MEMFS before main() runs, so `--test-file <path>` can find it.
+ * Cases can come from a file produced by llama-export-graph-ops, which carries a real
+ * model's shapes, strides and op_params. The file is fetched and written into MEMFS in
+ * preRun so `--test-file <path>` finds it, and its line count is what the verdict
+ * compares against.
  */
-async function preloadTestFile(argv) {
+async function loadTestFile(argv) {
   const at = argv.indexOf("--test-file");
   if (at < 0 || at + 1 >= argv.length) return undefined;
   const target = argv[at + 1];
   const name = target.replace(/^\/+/, "");
   const response = await fetch(`./${name}`);
   if (!response.ok) throw new Error(`could not fetch ${name}: HTTP ${response.status}`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  append(`test file: ${name} (${bytes.length} bytes)`);
-  return { target, bytes };
+  const text = await response.text();
+  const expected = countExpectedCases(text);
+  show(`test file: ${name} (${text.length} bytes, ${expected} case(s) expected)`);
+  return { target, bytes: new TextEncoder().encode(text), expected };
 }
 
 el("run").addEventListener("click", async () => {
   el("run").disabled = true;
   el("status").textContent = "running...";
-  lines.length = 0;
+  shown.length = 0;
   el("out").textContent = "";
   el("summary").textContent = "(running)";
-  el("summary").style.color = "";
+  el("summary").className = "";
 
   const argv = el("args").value.trim().split(/\s+/).filter(Boolean);
-  append(`argv: ${argv.join(" ")}`);
+  show(`argv: ${argv.join(" ")}`);
 
   try {
-    const testFile = await preloadTestFile(argv);
+    const testFile = await loadTestFile(argv);
+    const summary = new BackendOpsSummary({ expected: testFile?.expected ?? null });
+    // Every line goes to the judge as it arrives; the scrollback is a separate concern.
+    const emit = (text) => {
+      summary.feed(text + "\n");
+      show(text);
+    };
+
     const factory = (await import("./test-backend-ops.js")).default;
     await factory({
       arguments: argv,
-      print: append,
-      printErr: append,
+      print: emit,
+      printErr: emit,
       preRun: testFile
         ? [(mod) => {
             const dir = testFile.target.slice(0, testFile.target.lastIndexOf("/"));
@@ -179,17 +138,17 @@ el("run").addEventListener("click", async () => {
         el("status").innerHTML = code === 0
           ? '<span class="ok">exit 0</span>'
           : `<span class="bad">exit ${code}</span>`;
-        setVerdict(summarise(lines));
+        setVerdict(summary);
         el("run").disabled = false;
       },
       onAbort: (what) => {
         el("status").innerHTML = `<span class="bad">aborted: ${what}</span>`;
-        setVerdict(summarise(lines));
+        setVerdict(summary);
         el("run").disabled = false;
       },
     });
   } catch (error) {
-    append(`harness error: ${error?.message ?? error}`);
+    show(`harness error: ${error?.message ?? error}`);
     el("status").innerHTML = '<span class="bad">harness error</span>';
     el("run").disabled = false;
   }

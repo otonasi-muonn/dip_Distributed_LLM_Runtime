@@ -27,8 +27,23 @@ const ANSI = new RegExp(ESC + "\\[[0-9;]*m", "g");
 /** "Backend 1/2: WebGPU" */
 const SECTION_RE = /^Backend (\d+)\/(\d+): (.+)$/;
 
-/** "  MUL_MAT_ID(type_a=q2_K,...): OK" - two leading spaces, an op, parens, then outcome. */
-const CASE_RE = /^ {2}(\S+)\((.*)\): (.+)$/;
+/**
+ * "  MUL_MAT_ID(type_a=q2_K,...): OK" - an op, its parenthesised parameters, then the
+ * outcome at end of line.
+ *
+ * Deliberately not anchored to the leading two spaces. A failing case can be printed
+ * with its diagnostic prepended on the same line:
+ *
+ *   [GATED_DELTA_NET] inf mismatch: WebGPU=-inf CPU=-2.9e37   GATED_DELTA_NET(...): FAIL
+ *
+ * An anchored pattern skips exactly those lines - the failures - and the run then looks
+ * clean apart from a count that does not add up. That is how a real FAIL was missed
+ * here, caught only because the expected count did not match.
+ *
+ * Lines that are not cases have no parenthesised group before the colon, so they still
+ * do not match: "Backend 1/2: WebGPU", "  Skipping CPU backend", "131/132 tests passed".
+ */
+const CASE_RE = /(\S+)\((.*)\): (.+)$/;
 
 /** "  455/455 tests passed" - reported for reference only, never used to decide. */
 const SELF_REPORTED_RE = /^\s*\d+\/\d+ tests passed$/;

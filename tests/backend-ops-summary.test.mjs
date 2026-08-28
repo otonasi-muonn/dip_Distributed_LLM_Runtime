@@ -227,3 +227,40 @@ test("format() leads with the verdict and shows why it failed", () => {
   assert.match(text, /observed 450 case\(s\), expected 500/);
   assert.match(text, /expected cases {5}: 500/);
 });
+
+test("a FAIL printed with its diagnostic on the same line is still counted", () => {
+  // test-backend-ops prints a mismatch report inline, ahead of the case, so the line
+  // does not begin with the usual two spaces. A pattern anchored to those spaces would
+  // skip exactly the failures. Observed on a real Qwen3.6 run, where the only clue was
+  // that the case count did not add up.
+  const prefixed =
+    "[GATED_DELTA_NET] inf mismatch: WebGPU: WebGPU=-inf CPU=-29140014225397204652094542203917959168.000000" +
+    "   GATED_DELTA_NET(name=__fgdn_ch__-0,type=f32,ne=[4096,640,1,1],sources=f32[128,16,512,1]): FAIL";
+
+  const summary = run(
+    ["Backend 1/1: WebGPU", caseLine("A", "x", "OK"), prefixed].join("\n") + "\n",
+    { expected: 2 },
+  );
+
+  assert.equal(summary.sections[0].counts.FAIL, 1, "the prefixed line is a case, not noise");
+  assert.equal(summary.sections[0].counts.OK, 1);
+  const { pass, reasons } = summary.verdict();
+  assert.equal(pass, false);
+  assert.ok(reasons.some((r) => /1 FAIL/.test(r)), reasons.join("; "));
+});
+
+test("per-backend and per-run summary lines are still not cases", () => {
+  const summary = run(
+    [
+      "Backend 1/1: WebGPU",
+      caseLine("A", "x", "OK"),
+      "  Backend WebGPU: WebGPU: FAIL",
+      "  131/132 tests passed",
+      "1/2 backends passed",
+    ].join("\n") + "\n",
+    { expected: 1 },
+  );
+
+  assert.equal(summary.sections[0].counts.FAIL, 0, "the per-backend summary is not a case");
+  assert.equal(summary.verdict().pass, true, summary.verdict().reasons.join("; "));
+});

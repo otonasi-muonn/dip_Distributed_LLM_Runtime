@@ -160,7 +160,7 @@ Tab B  http://localhost:8890/?role=requester&id=req-1&peers=peer-1&fdmax=4&model
 
 | 最後に出た行 | 意味 |
 |---|---|
-| `encode node=i/N` で止まる | **encode 中**。特定 op の pipeline 生成かバインドで止まっている |
+| `encode node=i/N` で止まる | **encode 中**。追加の node/MUL_MAT/lifecycle marker が無ければ、特定 op の pipeline 生成・buffer・binding などのどこで止まったかは未確定 |
 | `submit #k after node=i` の直後で止まる | submit 自体が返らない |
 | `wait(partial) begin` で止まる | 中間 submit の完了待ち |
 | `wait(final) begin` + `WaitAny #n status=TimedOut` が増え続ける | **完了しない submission を無限に待っている** |

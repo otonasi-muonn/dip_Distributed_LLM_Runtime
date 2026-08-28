@@ -78,12 +78,16 @@ Full trace emitted by the peer, complete (10 lines, unchanged for >4 minutes):
 
 What this establishes:
 
-  - The stall is inside the encode loop, not in GPU completion. The last event
-    is an encode, and `wait(final)` is never reached.
-  - The GPU work that was submitted did complete: both wait(partial) calls
-    returned with retries=0.
-  - There are no WaitAny lines at all, so the "WaitAny retries forever on
-    TimedOut or Error" hypothesis is FALSIFIED for this stall.
+  - The last trace event is an encode, and `wait(final)` is never reached. This
+    places the observed stop before the final wait, but does not by itself prove
+    that earlier GPU submissions completed.
+  - Both `wait(partial)` calls returned with `retries=0`. In this old trace,
+    that only means the blocking wait loop ran zero times. The existing
+    zero-timeout poll was not traced, so its status and `subs` changes are
+    unknown; GPU submission completion is therefore UNTESTED here.
+  - There are no blocking WaitAny retry lines in this trace. The old trace did
+    not expose the zero-timeout poll, so the complete "WaitAny retries forever
+    on TimedOut or Error" hypothesis is not falsified by this evidence.
   - Encode lines are thinned to every 64 nodes and submits happen every 32
     kernels, so the stall is somewhere in nodes 129..192 of 1591. `submit #2`
     never appears.
@@ -204,9 +208,10 @@ With every node logged, the trace stops here and stays there:
 ggml_webgpu_encode_node() returns for node i. So node 156 finished, and the
 stall is inside encoding node 157 - whose op this build cannot name.
 
-It is not the submit: the submit trace prints before the submit call and no
-`submit #2` line ever appears. Nodes 105..156 simply never accumulated the 32
-kernels that trigger one.
+No `submit #2` line appears before this stop. Because the marker is printed
+before the submit call, this only says that nodes 105..156 did not accumulate
+the 32 kernels needed to reach that logged submission point. It does not rule
+out work from earlier submissions or establish GPU progress/completion.
 
 Nodes 149..156 (VIEW / PERMUTE / MUL_MAT / SOFT_MAX) are the shape of an
 attention block, so node 157 is plausibly the second MUL_MAT of attention - but
@@ -233,9 +238,11 @@ stayed there for over three minutes:
 
   submits: 2      wait(final): never      WaitAny lines: 0
 
-O11 IS: ggml_webgpu_encode_node() does not return for node 157, a MUL_MAT, in
-the granite MoE graph on this device. Not the GPU wait, not the submit, not an
-unsupported op - encoding one node.
+The strongest observation is that ggml_webgpu_encode_node() does not return
+for node 157, a MUL_MAT, in the granite MoE graph on this device. This is an
+encode-call boundary, not a root-cause classification: it does not distinguish
+the regular MUL_MAT path, resource creation, graph state, buffer/binding
+lifetime, pipeline handling, or GPU-side progress.
 
 That the previous build's last line was node 156 and this one's is 157 is
 exactly the one-line shift expected from moving the log ahead of the encode
@@ -243,16 +250,22 @@ call, which is a small confirmation that both builds saw the same stall.
 
 ### Why this is worth stating carefully
 
-MUL_MAT is not a suspect kernel. In Part D on this same device it passed 131 of
-131 executed cases at Qwen3.6's real shapes, including q2_K, q3_K, q4_K and q6_K
-sources up to [2048, 248320].
-
-So the same op that computes correctly on its own does not return when it is
-encoded at this point in a real graph. That points at the state the encode path
-is in - buffers, bindings, pipeline cache - rather than at the kernel, and it is
-precisely the ground Part D said it could not cover: "op を繋いだときの buffer
-alias / queue / 同期 / lifetime は未検証".
+Part D reported `OK 131` across all operations, not `MUL_MAT 131/131`.
+It also recorded standalone Qwen3.6 `MUL_MAT_ID` numerical cases, but those are
+not the same model/configuration as Granite node157's regular `MUL_MAT`.
+Therefore the node157 observation does not clear or implicate the `MUL_MAT`
+kernel, graph state, buffers, bindings, or pipeline cache. The standalone
+`patches/0004` numerical pass also does not cover full-graph state/lifetime;
+Part D explicitly did not test buffer alias / queue / synchronization / lifetime.
 
 ⚠️ Still one machine. Whether node 157 hangs on a discrete GPU is the next
 question, and docs/L2_TARGET_PC_RUNBOOK.md is written to answer it.
 
+## Codex 追加診断の状態 (2026-08-28)
+
+- **PASS**: `0005` に、既存 0-timeout poll の `status` と poll 前後の `subs` 数、node の name/type/shape、通常 `MUL_MAT` の src/dst metadata、`vec/fast/legacy` path、pipeline、workgroup、既存 build lifecycle 境界を追加した。0-timeout `WaitAny` の呼び出し自体は増やしていない。
+- **PASS**: 診断契約テストは `76/76`、pin 済み llama.cpp の一時 worktree で `0004` → `0005` を適用し、source diff check も成功した。encode 前の node metadata は残し、誤解を招く encode 完了 marker は追加しない。
+- **PASS**: `0004` → `0005` の patch chain は pin 済み llama.cpp に適用可能で、変更後 source の `git diff --check` も成功した。
+- **PASS**: `scripts/build-llmlet-reference.ps1` が `0001`〜`0005` を適用して Emscripten/Dawn buildを完了した。`build/reference-llmlet/BUILD_INFO.txt` に llama.cpp `c4b18b39d`、`0005` SHA256、JS/WASM artifact hashを記録した。
+- **UNTESTED**: 変更後 artifact による trace OFF → trace ON の同一条件 1 セット。したがって、追加 marker による node155/157 の shape/type/path/pipeline と partial poll の実測値はまだ無い。
+- **UNTESTED**: 明確なコード原因。停止区間を狭めただけでは修正理由にしないため、最小修正は入れていない。

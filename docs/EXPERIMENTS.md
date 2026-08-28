@@ -947,7 +947,7 @@ target に混ぜていない。
 ` / 末尾改行なし + `flush()`) を固定している。**判定器を UI callback の
 偶然の仕様に依存させない**ため。
 
-## 2026-08-28 O11 の停止位置を特定した (Part C) / Qwen3.6 実 op 検証 (Part D)
+## 2026-08-28 O11 の停止候補を狭めた (Part C) / Qwen3.6 実 op 検証 (Part D)
 
 ### Part C — trace で O11 の停止位置が出た
 
@@ -959,7 +959,9 @@ target に混ぜていない。
 | C1-2 | OFF | 8.7 s | なし | なし | 300 s timeout |
 | C2-1 | **ON** | 26.3 s | なし | なし | 300 s timeout |
 
-外形症状は 3 run とも一致 ⇒ **trace は症状を変えていない** (F57)。
+この旧 build の 3 run では外形症状が一致した。ただし、これは旧 build の結果であり、
+今回の診断変更後 build での OFF → ON 1 セットは未実施なので、変更後の trace 非影響は
+まだ **UNTESTED** とする。
 
 C2-1 の peer が出した trace は **10 行で完全停止** (678 秒後も同一):
 
@@ -976,9 +978,11 @@ wait(partial) end retries=0 subs=2
 encode node=128/1591 op=ADD        <-- 最終行
 ```
 
-**分かったこと (F56)**: 停止は **encode ループ内**。`wait(final)` 未到達、
-`wait(partial)` は **retries=0** で復帰、**`WaitAny` 行ゼロ** ⇒
-**「`WaitAny` が `TimedOut`/`Error` で永久リトライする」という機構仮説は反証**。
+**分かったこと (F56)**: 停止候補は **encode ループ内**。`wait(final)` 未到達。
+`wait(partial)` の **retries=0** は blocking wait loop が 0 回だったことを示すだけで、
+旧 trace は既存の 0-timeout poll の status / `subs` 変化を記録していないため、
+投入済み GPU submission の完了は判定できない。blocking `WaitAny` の retry trace が無いことから
+この測定で retry は観測されなかったが、全ての `WaitAny` retry 仮説を反証はしない。
 停止は node 129..192 のどこか。
 
 ### Part D — Qwen3.6 の実 op を 12.93GB 無しで検証
@@ -998,9 +1002,11 @@ VERDICT: NOT A PASS
   export 由来の F32 フォールバックが 4 バイト超過 ×2、Runtime が無効化している
   FLASH_ATTN_EXT ×2
 
-⚠️ **この PASS 範囲は「export された各 op を個別に実行した結果が CPU 参照と一致する」まで。**
-op を繋いだときの buffer alias / queue / 同期 / lifetime は未検証で、
-**O11 はまさにその領域**。
+⚠️ **この検証範囲は「export された各 op を個別に実行した結果が CPU 参照と一致する」まで。**
+`OK 131` は全 operation の合計で、通常 `MUL_MAT` の 131/131 という意味ではない。
+Qwen3.6 の個別 `MUL_MAT_ID` と Granite node157 の通常 `MUL_MAT` は同一モデル・同一 configuration
+ではない。op を繋いだときの buffer alias / queue / 同期 / lifetime は未検証で、
+**O11 はまさにその領域**。patch0004 の standalone numerical pass も full graph の state/lifetime を否定しない。
 
 ### 判定器がなければ見落としていた (F61)
 

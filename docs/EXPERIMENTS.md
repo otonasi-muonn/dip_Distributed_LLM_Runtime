@@ -514,6 +514,12 @@ console.log(navigator.gpu, crossOriginIsolated, typeof SharedArrayBuffer)
 
 ### Qwen3.6-35B-A3B について
 
+⚠️ **この節は 2026-08-28 の調査で古くなった。**下の「2026-08-28 Qwen3.6 対応」を先に読むこと。
+当時の見立ては「(c) upstream から cherry-pick が一見安いが、フォーク側のシェーダ埋め込み機構が
+upstream と異なる可能性が高く安く済む保証はない」だったが、**実際に調べたら (c) で通った** —
+シェーダ埋め込みは upstream と同じ `embed_wgsl.py` で、適応が要ったのは C++ の呼び出し規約1点だけ
+だった (`patches/0004`)。以下は当時の記録として残す。
+
 `DECISIONS.md` D8 の目標だが、**MoE であるため現状の WebGPU バックエンドでは動かない** (F14)。ストレッチですらなく別作業が前提になる。
 
 選択肢は3つ。(a) WGSL shader を自作、(b) フォーク全体を upstream 追随、(c) upstream から `mul_mat_id` 関連シェーダと `supports_op` の case だけ cherry-pick。(c) が一見安いが、フォーク側のシェーダ埋め込み機構が upstream と異なる可能性が高く安く済む保証はない。**いずれも3日では選べない。**
@@ -677,3 +683,335 @@ Runtime 内部の追加調査は打ち切る** ([CONSTRAINTS.md](CONSTRAINTS.md)
   provenance 検証が落ちた。`.gitattributes` の `/patches/*.patch text eol=lf` で固定した
 - `git diff --check` は `patches/*.patch` の**空 context 行の marker** を trailing whitespace として
   拾うが、これは patch の健全性の指標ではない。**patch validity は `git apply --check` で判定する**
+
+## 2026-08-28 Qwen3.6 対応 — Gate 1 / L1
+
+`docs/AI_CONTEXT.md` の P1 と `DECISIONS.md` D8 を、推測ではなく実測で動かすための一連の Gate。
+**方針は「MoE 以外を先に確定させ、差分を MoE / `MUL_MAT_ID` に絞る」。**
+
+### Gate 1 — GGUF header probe (モデルを落とさずに判定する)
+
+`scripts/probe-gguf-header.mjs` で HTTP Range によりヘッダだけ読む。13.5GB のうち約11MB。
+判定は「数MB取れた」ではなく **「header + metadata KV + tensor descriptors を完全に parse できた」**。
+
+| repo / file | arch | pre | block_count | nextn | expert 型 | `MUL_MAT_ID` 不可型 | tensor bytes |
+|---|---|---|---|---|---|---|---|
+| bartowski `Qwen_Qwen3.6-35B-A3B-Q2_K` | qwen35moe | qwen35 | **41** | **4本あり** | Q2_K/Q3_K/Q8_0 | なし | 13,495,788,032 |
+| unsloth `UD-Q2_K_XL` | qwen35moe | qwen35 | 40 | なし | IQ2_XS/IQ3_XXS/IQ4_XS | **全部不可** | 12,279,638,528 |
+| unsloth `UD-Q3_K_S` / `UD-Q3_K_M` | qwen35moe | qwen35 | 40 | なし | IQ 混在 | **不可あり** | 15.3G / 16.6G |
+| unsloth `UD-Q4_K_S` | qwen35moe | qwen35 | 40 | なし | Q4_K/Q6_K | なし | 20,882,024,960 |
+| **mradermacher `Qwen3.6-35B-A3B.Q2_K`** | qwen35moe | qwen35 | **40** | **なし** | **Q2_K/Q3_K** | **なし** | **12,928,604,672** |
+
+**採用: mradermacher の plain `Q2_K` (12.93GB)。**
+
+決め手:
+
+- `tokenizer.ggml.pre = qwen35` — pin の `llama-vocab.cpp:1972` が認識する。未知値は `throw` (`:2107`) なのでここは通るか落ちるかの二択だった
+- `block_count = 40` — pin の `llama-model.cpp` の `case 40: LLM_TYPE_35B_A3B` に一致
+- **nextn tensor が無い** — bartowski 版は `block_count=41` (40実層 + MTP層) で `blk.40.nextn.*` を4本持つ。
+  pin の `qwen35moe` は `nextn_predict_layers` を読まず、しかも `is_recurrent(40)` が true になるので
+  存在しない `blk.40.ssm_*` を必須テンソルとして要求する。**MTP 無しの版を選ぶことで、MTP 対応の
+  backport が丸ごと不要になった**
+- expert が Q2_K/Q3_K のみ — backport する `MUL_MAT_ID` は **IQ 系を持たない**ので、unsloth の UD 量子化は
+  expert が IQ になり使えない。K 量子化のみで最小なのがこの版
+- BF16 も消える — bartowski 版の BF16 2本は `blk.40` (MTP層) の `ffn_gate_inp` だけだった
+
+構造の一致は目視ではなく機械的に確認した。pin の `load_tensors` が `qwen35moe` で作るテンソルを
+`is_recurrent(i) = ((i+1) % 4 != 0)` ごとに列挙して突き合わせた結果:
+
+```text
+layers=40 recurrent=30 full_attention=10
+global tensors: output.weight, output_norm.weight, token_embd.weight
+tensors in file = 733
+tensors the pinned loader creates = 733
+STRUCTURE MATCHES the pinned qwen35moe loader
+```
+
+欠落も余剰も 0。したがって `done_getting_tensors()` の `wrong number of tensors` は起きない。
+
+byte accounting も閉じている: `12,928,604,672 (tensor) + 10,989,536 (dataStart) = 12,939,594,208` = ファイルサイズ。
+**Gate 6D はこの値と各 backend の buffer 合計を突き合わせる。生ファイルサイズとの一致は求めない。**
+
+### L1 — 未改造 Runtime で `qwen35` dense (Gated DeltaNet) を通す
+
+**パッチを1行も当てない状態**で `ggml-org/Qwen3.5-0.8B-GGUF` Q4_0 を Runtime-only harness に通した。
+`qwen35` は `qwen35moe` と同じ `llm_build_delta_net_base` を使うので、**Qwen3.6 の「MoE 以外」を
+先に確定させる**のが狙い。
+
+| | 結果 |
+|---|---|
+| L1-a (1 peer) | **PASS** — `<think>` を閉じて `Paris` を出力、EOS で完走 |
+| L1-b (2 peer) | **PASS** — 同上。層が 2 peer へ分散 |
+| L1-c (GDN 経路) | **PASS** — `fused Gated Delta Net (autoregressive) enabled` / `(chunked) enabled` |
+
+証拠 (L1-a):
+
+```text
+print_info: arch = qwen35 / n_layer = 24 / model type = 0.8B / model params = 752.39 M
+using device RPC0 (peer-1) (unknown id) - 2048 MiB free
+load_tensors:          CPU model buffer size =   257.66 MiB
+load_tensors: RPC0[peer-1] model buffer size =   526.51 MiB
+sched_reserve: RPC0[peer-1] compute buffer size =   487.00 MiB
+sched_reserve:        CPU compute buffer size =    14.02 MiB
+sched_reserve: graph splits = 2
+sched_reserve: fused Gated Delta Net (autoregressive) enabled
+sched_reserve: fused Gated Delta Net (chunked) enabled
+```
+
+反証仮説「requester のローカルで計算していただけでは」への回答:
+CPU 側は **257.66 MiB = `token_embd.weight` (Q8_0, F21 で必ず CPU に固定される) のみ**、
+compute buffer も CPU 14.02 MiB に対し peer 487.00 MiB。`ssm_*` テンソルは **126本** ロードされており、
+これは 24層中の recurrent 18層 × 7本と一致する。
+
+証拠 (L1-b, 2 peer):
+
+```text
+using device RPC0 (peer-1) - 2048 MiB free
+using device RPC1 (peer-2) - 2048 MiB free
+load_tensors: RPC0[peer-1] model buffer size =   146.07 MiB
+load_tensors: RPC0[peer-2] model buffer size =   380.43 MiB
+sched_reserve: graph splits = 3
+```
+
+反証仮説「片方の peer に全部乗っていないか」: 146.07 + 380.43 = 526.50 MiB で全層分。
+**偏ってはいるが分散はしている。**偏りは O7 の既知挙動 (両 peer とも `2048 MiB free` と申告し、
+出力テンソルが最終デバイスに乗る) と整合する。
+
+**したがって Qwen3.6 の Gated DeltaNet / hybrid recurrent / IMRoPE / gated attention は、
+pin 済み Runtime で既に動く。**残る差分は MoE = `MUL_MAT_ID` に絞られた。
+
+### この過程で分かった Runtime 以外の性質
+
+- **`main.cpp` には生成長の上限が無い** (`-n` / `n_predict` を parse していない)。EOS まで走るので、
+  thinking モデルが自己修正ループに入ると harness の timeout まで止まらない。実際
+  「Reply with one short sentence.」で 12,000 文字を超えるループになった。同じモデルでも
+  「What is the capital of France? Reply with only the city name.」なら 1 回で終わる。
+  **Gate 6G のプロンプトは終端しやすいものを選ぶ**
+- **生成中に requester のページを離脱すると peer が塞がる。** peer 側 `fdstats` は
+  旧 requester の fd が `live` のまま残り (`accepted=6 registrations=6 runtimeCloses=5`)、
+  次の requester は接続できずロードが進まない。F8 (1サーバ1クライアント、`rpc_serve_client` は
+  ブロッキング) の帰結。**peer を再起動すれば戻る。**Web 統合フェーズで
+  「requester がクラッシュ/離脱したときに peer をどう解放するか」は設計項目になる
+- **harness の `auto=1` 実行中は、手動の stop / cancel ボタンがその Runtime を掴んでいない。**
+  auto サイクルが握っているハンドルと画面のボタンが別物なので、auto 実行を途中で止めたいときは
+  ページを離脱するしかない (そして上の peer 詰まりを起こす)。**auto=1 は最後まで走らせる前提で使う**
+
+### Gate 4 — `MUL_MAT_ID` の数値検証 (backport 後)
+
+`harness/backend-ops` で llama.cpp 自身の `tests/test-backend-ops` をブラウザ実行した。
+これは各 op を「テスト対象 backend」と「CPU backend」の両方で走らせて結果を突き合わせる
+upstream のオラクルなので、**自作の比較器を書いていない**。
+
+```text
+Backend 1/2: WebGPU
+  MUL_MAT_ID(type_a=q2_K,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=32,k=256): OK
+  MUL_MAT_ID(type_a=q3_K,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=32,k=256): OK
+  ...
+  455/455 tests passed
+  Backend WebGPU: WebGPU: OK
+Backend 2/2: CPU
+  Skipping CPU backend
+2/2 backends passed
+```
+
+- **q2_K / q3_K が含まれる** — 採用した Qwen3.6 GGUF の expert 量子化そのもの
+- `n_mats` は 32 まで、`n=1..129` を網羅
+- 非対応型 (IQ 系 / MXFP4 / NVFP4 / BF16) は `not supported [WebGPU: WebGPU]` を返す。
+  **誤った値を返すのではない**ので、`supports_op` の gate が機能していることの裏でもある
+- 反証仮説「CPU に退避して通っただけでは」: `test-backend-ops` はテスト対象 backend を
+  明示し、CPU は**参照側**として `Skipping CPU backend` になる。**否定**
+
+`perf` モードでの単体性能 (参考、最適化 commit `#22464` を意図的に外した状態):
+
+```text
+MUL_MAT_ID(type_a=f32, n_mats=128,n_used=8,b=0,m=768,n=1,k=2048): 5056 us/run - 4.98 GFLOPS
+MUL_MAT_ID(type_a=f16, ...):                                      4586 us/run - 5.49 GFLOPS
+MUL_MAT_ID(type_a=q4_0,...):                                      3398 us/run - 7.41 GFLOPS
+```
+
+### L2 — 実 MoE モデル (granite 1B-A400M) を RPC peer で
+
+| | 結果 |
+|---|---|
+| L2-a: **CPU peer** | **PASS** — `Paris` を 30 秒未満で完答。`RPC0[peer-cpu] model buffer 782.12 MiB` / CPU 39.38 MiB |
+| L2-b: **WebGPU peer** | **FAIL (O11)** — load / graph 構築 / `ready` までは通る (`graph splits = 2`、abort 無し) が、生成が 4.4 分経っても 1 トークンも出ない |
+
+L2-b で観測したこと:
+
+```text
+print_info: arch = granitemoe / n_layer = 24 / n_expert = 32 / n_expert_used = 8
+load_tensors:          CPU model buffer size =    39.38 MiB
+load_tensors: RPC0[peer] model buffer size =   782.12 MiB
+sched_reserve: RPC0[peer] compute buffer size =   146.01 MiB
+sched_reserve: graph splits = 2
+-> ready
+-> generate: 出力 0 文字のまま。peer 側の RPC コマンドは 14 件で停止し増えない。
+   requester 側 / peer 側ともエラーログ 0 件。GPU 利用率 5.8%
+```
+
+**切り分けに使った対照実験**:
+
+| 条件 | 結果 |
+|---|---|
+| MoE × CPU peer | 完走 (30 秒未満) |
+| dense × WebGPU peer (patch 後) | 完走 (Qwen3.5-0.8B / Qwen2.5-0.5B とも) |
+| `MUL_MAT_ID` 単体 × WebGPU | 455/455 数値一致 |
+| MoE × WebGPU peer | **返らない** |
+
+⇒ **問題領域を「WebGPU backend 固有、または WebGPU backend と実 MoE graph / RPC の
+組み合わせ」まで絞れた。**⚠️ ここから先は言えない — RPC serialization 単体は CPU peer で
+動くが、「RPC で作られた graph × WebGPU の buffer / layout / command encoding」の相互作用は
+残る。**hang / 極端な同期遅延 / 特定 op・graph 構成のどれかも未確定** (O11)。
+
+⚠️ **次の 2 つは推論であって実測ではないので、結論に使わない**:
+
+- 「単体 op が 3.4-5.1 ms なので単純な遅さではない」 — **op 単体の値から graph 全体
+  (routing / copies / 同期 / RPC / queue submit-wait) の所要時間は導けない**
+- 「GPU 5.8% なので hang でも飽和でもない」 — **同期ボトルネックでも普通に出る**し、
+  GPU が動いていることは **graph が前進している証明にならない** (同じ箇所の反復でも観測される)
+
+### 計測時に踏んだ罠 (追加)
+
+- **最初の 9 分試行は無効。** コンソールに `net::ERR_NETWORK_IO_SUSPENDED` が出ており、
+  model chunk の fetch が失敗して `Uncaught [object WebAssembly.Exception]` になっていた。
+  **マシン/ブラウザのサスペンドが原因**で、Runtime の問題ではない。
+  **長い `sleep` で待つと在席が切れる** — 短い間隔で観測して覚醒を保つこと。
+  再測定 (覚醒確認済み・両側エラー 0 件) でも同じ症状が出たので、O11 自体は環境要因だけでは
+  説明できない
+- **`test-backend-ops` の出力は ANSI 色付き。** `OK` / `FAIL` の前後にエスケープが入るので、
+  行頭・行末アンカーで判定する前に落とすこと (`harness/backend-ops/index.html` で対応済み)
+- **`docker build ... | tail` は終了コードを隠す。** 実際には失敗しているのに
+  「exit 0」に見えた。ビルドはパイプせず、`$?` を明示的に見ること
+- **`GGML_RPC=ON` で `test-backend-ops` はリンクできない。** fork は RPC のソケット層を
+  `recv_peer` などの extern に置き換えており、実体は llmlet の `libllmlet.js` にある。
+  数値検証に RPC は不要なので `GGML_RPC=OFF` にした
+
+## 2026-08-28 判定器を fail-closed にした (Part A)
+
+Qwen3.6 の実形状 op を検証する前に、**判定器そのもの**を直した。敵対的レビューで
+穴が 2 回続けて見つかったため、今回は
+**「悪い結果を拾えるか」だけでなく「何件検証するはずだったか / 実際に何件判定したか」**
+を合格条件に入れた。
+
+### 塞いだ穴
+
+| # | 穴 | なぜ通ってしまうか |
+|---|---|---|
+| 1 | 表示用に 4000 行で truncate している配列を判定にも使っていた | 長い run の前半に出た `FAIL` / `NOT_SUPPORTED` が捨てられた後で判定が走る |
+| 2 | `unclassified` を計算しながら合否に入れていない。`SKIPPED` は分類すらしていない | `SKIPPED` は `NOT_SUPPORTED` と同じく `tests_run` から除外される側 (F52) |
+| 3 | 出力されたケース行しか数えていない | **そもそも出力されなかったケース**が見えない (500 件中 450 件が出て全部 OK → PASS) |
+| 4 | backend を名前で集約していた | `WebGPU: GPU-A` 250 + `WebGPU: GPU-B` 250 = 500 = EXPECTED → PASS |
+
+### 現在の合格条件
+
+```text
+PASS =
+    target (WebGPU) section がちょうど 1 つ
+ && EXPECTED > 0                       (= --test-file の非空行数)
+ && OBSERVED == EXPECTED               (OBSERVED = OK+FAIL+NOT_SUPPORTED+SKIPPED+UNKNOWN)
+ && OK       == EXPECTED
+ && FAIL == 0 && NOT_SUPPORTED == 0 && SKIPPED == 0 && UNKNOWN == 0
+```
+
+`--test-file` を使わない実行では EXPECTED が不明なので、
+**compatibility gate の PASS としては扱わない**と明示する。
+
+`EXPECTED` を入力から取れるのは、`export-graph-ops` が 1 `test_object` の serialize 末尾に
+`out << '
+'` を書き、`make_test_cases_from_file` が `std::getline` で 1 行 1 ケースとして
+読むため (F53)。
+
+### 実測 — 旧判定器なら PASS にしていた run
+
+この機で `-o MUL_MAT_ID -p n_mats=4` を実行した結果:
+
+```text
+self-reported : 232/232 tests passed        (exit 0)
+実際          : 358 cases / OK 232 / NOT SUPPORTED 126 / FAIL 0
+VERDICT       : NOT A PASS
+                - expected case count is unknown (no --test-file)
+target section: 1/2 WebGPU
+all sections  : 1/2 WebGPU (358) | 2/2 CPU (0)
+```
+
+**プログラム自身は `232/232 tests passed` かつ `exit 0` を報告しているのに、
+126 件は実行を拒否されている。** F52 がそのまま観測できた形。
+新しい判定器は `NOT A PASS` を出し、理由を名指しし、CPU section の 0 件を
+target に混ぜていない。
+
+### 判定器の単体テスト
+
+`tests/backend-ops-summary.test.mjs` (18 本)。上の穴 1-4 それぞれに回帰テストがあり、
+加えて **chunk 安全性** (1 ケースを 2 callback に分割 / 2 ケースを 1 callback /
+`
+` / 末尾改行なし + `flush()`) を固定している。**判定器を UI callback の
+偶然の仕様に依存させない**ため。
+
+## 2026-08-28 O11 の停止候補を狭めた (Part C) / Qwen3.6 実 op 検証 (Part D)
+
+### Part C — trace で O11 の停止位置が出た
+
+`patches/0005` (WebGPU graph progress trace) をビルドし、固定条件で 3 run:
+
+| run | trace | ready | first token | error | 結果 |
+|---|---|---|---|---|---|
+| C1-1 | OFF | 35.4 s | なし | なし | 300 s timeout |
+| C1-2 | OFF | 8.7 s | なし | なし | 300 s timeout |
+| C2-1 | **ON** | 26.3 s | なし | なし | 300 s timeout |
+
+この旧 build の 3 run では外形症状が一致した。ただし、これは旧 build の結果であり、
+今回の診断変更後 build での OFF → ON 1 セットは未実施なので、変更後の trace 非影響は
+まだ **UNTESTED** とする。
+
+C2-1 の peer が出した trace は **10 行で完全停止** (678 秒後も同一):
+
+```text
+graph_compute begin n_nodes=1591
+encode node=0/1591 op=SCALE
+submit #0 after node=48 kernels=33
+wait(partial) begin subs=1
+wait(partial) end retries=0 subs=1
+encode node=64/1591 op=ADD
+submit #1 after node=104 kernels=32
+wait(partial) begin subs=2
+wait(partial) end retries=0 subs=2
+encode node=128/1591 op=ADD        <-- 最終行
+```
+
+**分かったこと (F56)**: 停止候補は **encode ループ内**。`wait(final)` 未到達。
+`wait(partial)` の **retries=0** は blocking wait loop が 0 回だったことを示すだけで、
+旧 trace は既存の 0-timeout poll の status / `subs` 変化を記録していないため、
+投入済み GPU submission の完了は判定できない。blocking `WaitAny` の retry trace が無いことから
+この測定で retry は観測されなかったが、全ての `WaitAny` retry 仮説を反証はしない。
+停止は node 129..192 のどこか。
+
+### Part D — Qwen3.6 の実 op を 12.93GB 無しで検証
+
+`export-graph-ops` がメタデータのみから **136 unique ops** (prefill 73 / decode 63) を出力。
+
+```text
+VERDICT: NOT A PASS
+  expected 136 / observed 136
+  OK 131 / FAIL 1 / NOT SUPPORTED 4 / SKIPPED 0 / UNKNOWN 0
+```
+
+- **256 experts の `MUL_MAT_ID` (`ffn_moe_down`, 実 Q3_K) は prefill・decode とも OK** (F58)
+- **FAIL 1**: chunked Gated DeltaNet が WebGPU=-inf / CPU=-2.9e37 (F59)。
+  ⚠️ 乱数入力で両側とも overflow 近傍なので**カーネル欠陥と断定しない**
+- **NOT SUPPORTED 4**: いずれも実モデルの性質ではない (F60) —
+  export 由来の F32 フォールバックが 4 バイト超過 ×2、Runtime が無効化している
+  FLASH_ATTN_EXT ×2
+
+⚠️ **この検証範囲は「export された各 op を個別に実行した結果が CPU 参照と一致する」まで。**
+`OK 131` は全 operation の合計で、通常 `MUL_MAT` の 131/131 という意味ではない。
+Qwen3.6 の個別 `MUL_MAT_ID` と Granite node157 の通常 `MUL_MAT` は同一モデル・同一 configuration
+ではない。op を繋いだときの buffer alias / queue / 同期 / lifetime は未検証で、
+**O11 はまさにその領域**。patch0004 の standalone numerical pass も full graph の state/lifetime を否定しない。
+
+### 判定器がなければ見落としていた (F61)
+
+`test-backend-ops` は失敗ケースを診断文の後ろに同じ行で出す。行頭 2 スペースに
+anchor していた分類器はそれだけを取りこぼし、**OK 131 / FAIL 0 / observed 135** と読めた。
+**入力 136 件と合わないことだけが手がかり**で、anchor を外して observed 136 / FAIL 1。
+
+生の trace と全ケースの内訳: `docs/evidence/o11-780m-trace-2026-08-28.txt`

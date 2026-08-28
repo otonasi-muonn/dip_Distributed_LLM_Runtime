@@ -1,0 +1,64 @@
+# Build llama.cpp's tests/export-graph-ops, which writes out the ops a model's graph
+# actually contains - with their real shapes, strides and op_params - from the GGUF
+# metadata alone.
+#
+# This is what lets us test Qwen3.6 at its real dimensions (256 experts, k=2048) without
+# the 12.93 GB download: common_params_parse sets skip_model_download for this example
+# (common/arg.cpp:541, "export_graph_ops loads only metadata") and the model is created
+# with no_alloc, so only the header is fetched. It reserves both the prefill and the
+# decode graph (export-graph-ops.cpp:198-210), so ops that only appear during decode are
+# not missed.
+#
+# Native, not Emscripten: this only builds a graph, and the browser side is
+# test-backend-ops, which consumes the file this produces.
+#
+# The HF metadata path needs cpp-httplib with OpenSSL. That is gated on LLAMA_OPENSSL,
+# which enables the gguf-model-data target, which is what defines LLAMA_HF_FETCH for
+# export-graph-ops (tests/CMakeLists.txt:265-298). Without it the tool can only read a
+# local file, which would mean downloading the model after all.
+#
+# Build context is the llmlet checkout:
+#
+#     docker build -f harness/backend-ops/Dockerfile.export-ops -t llamacpp-export-ops:local .work/llmlet
+
+FROM debian:bookworm-slim AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ca-certificates \
+        libssl-dev libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /work/
+WORKDIR /work/llama.cpp
+
+# GGML_NATIVE=OFF: this image may be built on one machine and run on another, and none
+# of it is performance-sensitive - it builds a graph and writes a text file.
+#
+# BUILD_SHARED_LIBS=OFF: llama.cpp defaults to shared libraries, and the runtime
+# stage below copies only the binary. Without this it starts and dies at once with
+# "libllama.so.0: cannot open shared object file". Linking statically keeps the
+# runtime stage a single file instead of tracking which .so files must come along.
+RUN cmake -B /eb \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_OPENSSL=ON \
+        -DLLAMA_CURL=ON \
+        -DLLAMA_BUILD_TESTS=ON \
+        -DLLAMA_BUILD_TOOLS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_SERVER=OFF \
+        -DGGML_NATIVE=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+    && cmake --build /eb --target export-graph-ops -j$(nproc) \
+    && mkdir -p /out \
+    && find /eb -name export-graph-ops -type f -exec cp {} /out/ \; \
+    && ls -la /out
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 libcurl4 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/export-graph-ops /usr/local/bin/export-graph-ops
+WORKDIR /out
+ENTRYPOINT ["/usr/local/bin/export-graph-ops"]

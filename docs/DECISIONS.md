@@ -13,7 +13,7 @@
 | D5 | 制御プレーン = Hono WebSocket / データプレーン = WebRTC DataChannel (P2P) | 製品判断 | 重いテンソルを Hono で中継すると無線区間を2回通過するため | Web repo `docs/tech-selection-rationale.md` |
 | D6 | 層の割り当ては llama.cpp 本体に委譲する。Hono は名簿管理に徹する | **upstream 文書に基づく仮説** | RPC が重みと KV キャッシュを available memory 比例で自動配分する (F7)。⚠️ **既知の乖離あり** — 配分の入力となる WebGPU の `get_memory` は実空きではなく `maxBufferSize` という定数を返す (F20)。**比例配分は事実上成立していない** (O7) | llama.cpp `tools/rpc/README.md` |
 | D7 | **STUN / TURN は P0 では導入しない。LAN 接続の失敗リスクを受容する** | 製品判断 | LAN 内なら host candidate だけで疎通できる想定。ただし **mDNS 解決失敗・AP isolation という失敗モードが未解決 (O4) であり、「不要」と言い切れる根拠は無い** | `CONSTRAINTS.md` O4 |
-| D8 | 主要な検証候補モデルは Qwen3.6-35B-A3B | 製品判断 | ⚠️ **MoE であるため、現状の WebGPU バックエンドでは動かない** (`CONSTRAINTS.md` の O0 / F14)。デモは dense モデルで組み、本モデルは別作業を前提とする条件付き将来項目として扱う | `CONSTRAINTS.md` / `EXPERIMENTS.md` |
+| D8 | 主要な検証候補モデルは Qwen3.6-35B-A3B | 製品判断 | **2026-08-28 更新。**「MoE だから WebGPU で動かない」という当初の理由は**解消した** — `MUL_MAT_ID` を backport し数値まで検証済み (F46)、architecture / tokenizer / tensor 構造も pin がそのまま扱える (F45)。**ただし real MoE graph を WebGPU peer で最後まで実行できることはまだ証明できていない (O11) ため、依然としてデモの既定は dense モデル。** 詳細: [QWEN36_RESULT_2026-08-28.md](QWEN36_RESULT_2026-08-28.md) | `CONSTRAINTS.md` / `QWEN36_RESULT_2026-08-28.md` |
 | D9 | **llama.cpp RPC の公式警告を認識した上で、会場 LAN での稼働リスクを受容する** | 製品判断 | 公式は「Never run the RPC server on an open network or in a sensitive environment!」と明記し、実装を fragile かつ insecure な PoC としている。**ピアとして動くのは参加者個人の端末**であるため、これは技術判断ではなく運営判断として引き受ける必要がある | `CONSTRAINTS.md` F7 |
 | D10 | **参加者に対し、自分の端末の計算資源が他者の推論に使われることを事前に告知する** | 製品判断 (**要実装・未着手**) | ボランティアコンピューティング的な構成であり、告知・同意の導線が現状どの文書にも無い。また第三者端末のメモリ上で処理が行われる。加えて RPC には 1MiB 超のテンソル payload を IndexedDB へキャッシュする実装があるが (F5)、**プロンプト由来のデータがこの経路とサイズ条件を通る範囲は未確認** | compliance レビュー指摘 |
 
@@ -33,9 +33,13 @@
 
 ## D8 について
 
-MoE を選んだ理由 (活性 3B なので遅い相互接続に有利) が、**pin されている WebGPU バックエンドが実装していない演算 (`MUL_MAT_ID`) と一致している**。デモの最低ライン (`EXPERIMENTS.md` 段5) は dense モデルで組むこと。
+**2026-08-28 に前提が変わった。** 当初は「MoE を選んだ理由 (活性 3B なので遅い相互接続に有利) が、pin されている WebGPU バックエンドが実装していない演算 (`MUL_MAT_ID`) と一致している」ことが問題だった。この演算は upstream から backport し (`patches/0004`)、**WebGPU 上で CPU 参照と 455/455 一致することまで確認した** (F46)。architecture・tokenizer・tensor 構造も pin がそのまま扱えることが分かっている (F45)。
 
-なお「ピアに CPU バックエンドも登録すれば自動で退避する」わけではない。`rpc_server` は複数バックエンドを持てる (F18) が、クライアントは RPC デバイスの実サポートを知らない (F15) ため、実際に直すには `supports_op` の TODO も併せて実装する必要がある。
+**残っているのは別の問題**: 実 MoE モデルを WebGPU peer で走らせると first token に到達しない (O11)。**WebGPU 固有経路までは切り分け済みだが、hang / 極端な同期遅延 / 特定 op・graph 構成のどれかは未確定**。しかも**測定は統合GPU 1 台でしか行っていない**。discrete GPU 機での再現確認が先。
+
+したがって **デモの既定は引き続き dense モデル**。ただし理由は「MoE が動かないから」ではなく「MoE の WebGPU 実行に未解決の問題が 1 つ残っているから」に変わった。
+
+なお「ピアに CPU バックエンドも登録すれば自動で退避する」わけではない。`rpc_server` は複数バックエンドを持てる (F18) が、クライアントは RPC デバイスの実サポートを知らない (F15) ため、実際に直すには `supports_op` の TODO も併せて実装する必要がある。⚠️ **ただし O11 に関しては、未対応 op は存在しないのでこの経路は効かない。**
 
 ## D10 について
 

@@ -1,0 +1,320 @@
+Observability only. This adds no capability and changes no result; it exists so a
+stalled graph_compute says where it stopped.
+
+Why it is needed. When a real MoE model is run on a WebGPU RPC peer, graph_compute
+does not return and neither side prints anything at all (docs/CONSTRAINTS.md O11).
+That silence is structural, not incidental:
+
+    ggml-webgpu.cpp, ggml_backend_webgpu_wait()
+        while (blocking_wait) {
+            waitStatus = instance.WaitAny(1, &subs[0].submit_done, 100ms);
+            if (handle_wait_status(waitStatus, true)) { ... subs.erase(...); }
+            blocking_wait = (block && !subs.empty()) || ...;
+        }
+
+handle_wait_status returns false for TimedOut (silently, when allow_timeout is set)
+and false for Error (after logging), and neither erases the submission - so either
+status spins at 10 Hz forever while graph_compute never returns.
+
+What it separates. Encoding, the selected node metadata/pipeline path, an intermediate
+submit, the final completion wait, and the WaitAny status are different observations that
+currently look identical from the outside:
+
+    graph_compute begin n_nodes=N
+    encode node=i/N op=...            before encoding node i, every
+                                      GGML_WEBGPU_TRACE_STRIDE nodes
+                                      (default 64), and the last one
+    submit #k after node=i kernels=n
+    wait(partial|final) begin subs=k
+    wait(partial) poll status=... subs_before=k subs_after=k|k-1
+    WaitAny #n status=TimedOut|Error|Unknown      (blocking loop only)
+    wait(partial|final) end retries=n subs=k
+    mul_mat path=vec|fast|legacy pipeline=...
+    build_multi[...] param_alloc|bind_group|encoder|dispatch|finish ...
+    graph_compute end
+
+Deliberate choices:
+
+  - Off unless GGML_WEBGPU_TRACE is set in the environment. A build can then be
+    carried to the machine where the stall reproduces and switched on there, instead
+    of being rebuilt there. The Runtime adapter passes it through Module.ENV, the
+    same way it already sets NO_COLOR.
+  - Nodes are logged every 64 by default, not every node: thousands of lines would
+    make the logging itself a plausible reason the timing changed.
+  - WaitAny retries are thinned to 1, 10, 50, then every 100 up to 1000, then every
+    1000 - roughly immediately, 1 s, 5 s, every 10 s, then every 100 s at the 100 ms
+    timeout. **A change of status is always reported regardless of thinning**, because
+    spinning on TimedOut and spinning on Error are different faults and the thinning
+    would otherwise hide the moment one becomes the other.
+
+GGML_WEBGPU_TRACE_STRIDE narrows that once a stall is known to sit inside one of
+those windows: set it to 1 and the last line names the node. Too noisy to leave on,
+and useless before there is a window to narrow, which is why it is not the default.
+
+This is not a Qwen3.6 compatibility patch and nothing depends on it. If O11 is
+resolved without it, drop it.
+
+diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+index d9580cb8e..160ea86d8 100644
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -18,6 +18,7 @@
+ #include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #ifdef GGML_WEBGPU_GPU_PROFILE
+ #    include <iomanip>
+@@ -499,6 +500,69 @@ static void ggml_backend_webgpu_wait_profile_futures(webgpu_global_context &
+ #endif
+ 
+ // Wait for the queue to finish processing all submitted work
++// Progress trace for graph_compute. Off unless GGML_WEBGPU_TRACE is set in the
++// environment, so one build can be carried to a machine where a stall reproduces and
++// switched on there rather than rebuilt there.
++//
++// This exists because a stalled graph_compute is completely silent. The WaitAny loop
++// below retries on TimedOut *and* on Error without erasing the submission, so a
++// submission that never completes spins forever with no output at all. Whether we are
++// still encoding, waiting on an intermediate submit, or spinning in the final wait are
++// three different bugs, and nothing in the current output distinguishes them.
++static bool ggml_webgpu_trace_enabled() {
++    static const bool enabled = getenv("GGML_WEBGPU_TRACE") != nullptr;
++    return enabled;
++}
++#define WEBGPU_TRACE(...)                                    \
++    do {                                                     \
++        if (ggml_webgpu_trace_enabled()) {                   \
++            GGML_LOG_INFO("webgpu-trace: " __VA_ARGS__);      \
++        }                                                    \
++    } while (0)
++
++// One line per node would be thousands of lines per graph, and the logging itself would
++// then be a plausible reason the timing changed.
++// How many nodes between encode lines. 64 keeps a 1591-node graph to ~25 lines, which
++// is enough to say which phase a stall is in. Narrowing a stall to one node needs
++// GGML_WEBGPU_TRACE_STRIDE=1, which is far too noisy to be the default but is the whole
++// point once a graph is known to stop somewhere in a 64-node window.
++static int ggml_webgpu_trace_stride() {
++    static const int stride = [] {
++        const char * env = getenv("GGML_WEBGPU_TRACE_STRIDE");
++        const int    n   = env ? atoi(env) : 0;
++        return n > 0 ? n : 64;
++    }();
++    return stride;
++}
++
++static const char * ggml_webgpu_wait_status_name(wgpu::WaitStatus status) {
++    switch (status) {
++        case wgpu::WaitStatus::Success:
++            return "Success";
++        case wgpu::WaitStatus::TimedOut:
++            return "TimedOut";
++        case wgpu::WaitStatus::Error:
++            return "Error";
++        default:
++            return "Unknown";
++    }
++}
++
++// 1, 10, 50, then every 100 up to 1000, then every 1000. At a 100 ms timeout that is
++// roughly: immediately, 1 s, 5 s, every 10 s, then every 100 s.
++static bool ggml_webgpu_trace_retry(uint64_t n) {
++    if (n <= 1 || n == 10 || n == 50) {
++        return true;
++    }
++    if (n < 100) {
++        return false;
++    }
++    if (n <= 1000) {
++        return n % 100 == 0;
++    }
++    return n % 1000 == 0;
++}
++
+ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
+                                      std::vector<webgpu_submission> & subs,
+                                      bool                             block = true) {
+@@ -506,9 +571,26 @@ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
+         return;
+     }
+ 
++    WEBGPU_TRACE("wait(%s) begin subs=%zu\n", block ? "final" : "partial", subs.size());
++
++    uint64_t     wait_retries = 0;
++    const char * wait_state   = nullptr;
++
+     bool blocking_wait = block || subs.size() >= WEBGPU_MAX_INFLIGHT_SUBS_PER_THREAD;
+     while (blocking_wait) {
+         auto waitStatus = ctx->instance.WaitAny(1, &subs[0].submit_done, WEBGPU_WAIT_ANY_TIMEOUT_MS * 1e6);
++        wait_retries++;
++        if (ggml_webgpu_trace_enabled()) {
++            const char * state = ggml_webgpu_wait_status_name(waitStatus);
++            // Report every change of status, not just the thinned samples: spinning on
++            // TimedOut and spinning on Error are different faults, and the thinning
++            // could otherwise hide the moment one becomes the other.
++            if (state != wait_state || ggml_webgpu_trace_retry(wait_retries)) {
++                GGML_LOG_INFO("webgpu-trace: WaitAny #%llu status=%s subs=%zu\n",
++                              (unsigned long long) wait_retries, state, subs.size());
++                wait_state = state;
++            }
++        }
+         if (ggml_backend_webgpu_handle_wait_status(waitStatus, true)) {
+ #ifdef GGML_WEBGPU_GPU_PROFILE
+             ggml_backend_webgpu_wait_profile_futures(ctx, subs[0].profile_futures, true);
+@@ -518,6 +600,9 @@ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
+         blocking_wait = (block && !subs.empty()) || subs.size() >= WEBGPU_MAX_INFLIGHT_SUBS_PER_THREAD;
+     }
+ 
++    WEBGPU_TRACE("wait(%s) end retries=%llu subs=%zu\n", block ? "final" : "partial",
++                 (unsigned long long) wait_retries, subs.size());
++
+     if (subs.empty()) {
+         return;
+     }
+@@ -521,16 +610,21 @@ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
+     // Poll each submit future once and remove completed submissions.
+     for (auto sub = subs.begin(); sub != subs.end();) {
++        const size_t subs_before = subs.size();
++        WEBGPU_TRACE("wait(%s) poll begin subs=%zu\n", block ? "final" : "partial", subs_before);
+         auto waitStatus = ctx->instance.WaitAny(1, &sub->submit_done, 0);
++        const char * state = ggml_webgpu_wait_status_name(waitStatus);
+         bool success    = ggml_backend_webgpu_handle_wait_status(waitStatus, true);
+ #ifdef GGML_WEBGPU_GPU_PROFILE
+         ggml_backend_webgpu_wait_profile_futures(ctx, sub->profile_futures, false);
+         if (success && sub->profile_futures.empty()) {
+ #else
+         if (success) {
+ #endif
+             sub = subs.erase(sub);
+         } else {
+             ++sub;
+         }
++        WEBGPU_TRACE("wait(%s) poll end status=%s subs_before=%zu subs_after=%zu\n",
++                     block ? "final" : "partial", state, subs_before, subs.size());
+     }
+ }
+@@ -639,17 +729,21 @@ static webgpu_command ggml_backend_webgpu_build_multi(
+     for (size_t i = 0; i < pipelines.size(); i++) {
++        WEBGPU_TRACE("build_multi[%zu] param_alloc begin pipeline=%s\n", i, pipelines[i].name.c_str());
+         wgpu::Buffer params_bufs = param_buf_pool.alloc_bufs();
++        WEBGPU_TRACE("build_multi[%zu] param_alloc end pipeline=%s\n", i, pipelines[i].name.c_str());
+ 
+         std::vector<wgpu::BindGroupEntry> entries            = bind_group_entries_list[i];
+         uint32_t                          params_binding_num = entries.size();
+         entries.push_back(
+             { .binding = params_binding_num, .buffer = params_bufs, .offset = 0, .size = params_bufs.GetSize() });
+ 
+         wgpu::BindGroupDescriptor bind_group_desc;
+         bind_group_desc.layout     = pipelines[i].pipeline.GetBindGroupLayout(0);
+         bind_group_desc.entryCount = entries.size();
+         bind_group_desc.entries    = entries.data();
+         bind_group_desc.label      = pipelines[i].name.c_str();
++        WEBGPU_TRACE("build_multi[%zu] bind_group begin pipeline=%s entries=%zu\n", i, pipelines[i].name.c_str(), entries.size());
+         bind_groups.push_back(ctx->device.CreateBindGroup(&bind_group_desc));
++        WEBGPU_TRACE("build_multi[%zu] bind_group end pipeline=%s\n", i, pipelines[i].name.c_str());
+ 
+         params_bufs_list.push_back(params_bufs);
+     }
+@@ -657,4 +751,5 @@ static webgpu_command ggml_backend_webgpu_build_multi(
+     wgpu::CommandEncoder encoder = ctx->device.CreateCommandEncoder();
++    WEBGPU_TRACE("build_multi encoder begin pipelines=%zu\n", pipelines.size());
+     for (size_t i = 0; i < params_bufs_list.size(); i++) {
+         ctx->queue.WriteBuffer(params_bufs_list[i], 0, params_list[i].data(), params_list[i].size() * sizeof(uint32_t));
+     }
+@@ -672,9 +767,13 @@ static webgpu_command ggml_backend_webgpu_build_multi(
+ #else
+     wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+ #endif
++    WEBGPU_TRACE("build_multi dispatch begin pipelines=%zu\n", pipelines.size());
+     for (size_t i = 0; i < pipelines.size(); i++) {
+         pass.SetPipeline(pipelines[i].pipeline);
+         pass.SetBindGroup(0, bind_groups[i]);
+         pass.DispatchWorkgroups(workgroups_list[i].first, workgroups_list[i].second, 1);
++        WEBGPU_TRACE("build_multi dispatch[%zu] pipeline=%s wg=[%u,%u]\n", i, pipelines[i].name.c_str(),
++                     workgroups_list[i].first, workgroups_list[i].second);
+     }
++    WEBGPU_TRACE("build_multi dispatch end pipelines=%zu\n", pipelines.size());
+     pass.End();
+@@ -687,4 +784,5 @@ static webgpu_command ggml_backend_webgpu_build_multi(
+     wgpu::CommandBuffer commands = encoder.Finish();
++    WEBGPU_TRACE("build_multi finish end pipelines=%zu\n", pipelines.size());
+     webgpu_command      result   = {};
+     result.commands              = commands;
+     result.params_bufs           = params_bufs_list;
+@@ -1376,5 +1466,17 @@ static webgpu_command ggml_webgpu_mul_mat(webgpu_context & ctx,
+         default:
+             break;
+     }
++    WEBGPU_TRACE("mul_mat src0 name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] off=%zu size=%zu\n",
++                 ggml_get_name(src0), ggml_type_name(src0->type), (long long) src0->ne[0], (long long) src0->ne[1],
++                 (long long) src0->ne[2], (long long) src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
++                 ggml_webgpu_tensor_offset(src0), ggml_webgpu_tensor_binding_size(ctx, src0));
++    WEBGPU_TRACE("mul_mat src1 name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] off=%zu size=%zu\n",
++                 ggml_get_name(src1), ggml_type_name(src1->type), (long long) src1->ne[0], (long long) src1->ne[1],
++                 (long long) src1->ne[2], (long long) src1->ne[3], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
++                 ggml_webgpu_tensor_offset(src1), ggml_webgpu_tensor_binding_size(ctx, src1));
++    WEBGPU_TRACE("mul_mat dst name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] off=%zu size=%zu\n",
++                 ggml_get_name(dst), ggml_type_name(dst->type), (long long) dst->ne[0], (long long) dst->ne[1],
++                 (long long) dst->ne[2], (long long) dst->ne[3], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
++                 ggml_webgpu_tensor_offset(dst), ggml_webgpu_tensor_binding_size(ctx, dst));
+ 
+     ggml_webgpu_shader_lib_context shader_lib_ctx = {
+@@ -1399,5 +1501,7 @@ static webgpu_command ggml_webgpu_mul_mat(webgpu_context & ctx,
+     } else {
+         pipeline = ctx->shader_lib->get_mul_mat_legacy_pipeline(shader_lib_ctx);
+     }
++    const char * path = use_fast ? (is_vec ? "vec" : "fast") : "legacy";
++    WEBGPU_TRACE("mul_mat path=%s pipeline=%s is_vec=%d use_fast=%d\n", path, pipeline.name.c_str(), is_vec, use_fast);
+ 
+     // Build params
+@@ -2929,12 +3014,24 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+     webgpu_context                ctx         = backend_ctx->webgpu_ctx;
+ 
+     WEBGPU_CPU_PROFILE_TOTAL_START(graph_compute);
++    WEBGPU_TRACE("graph_compute begin n_nodes=%d\n", cgraph->n_nodes);
+ 
+     std::vector<webgpu_command>    commands;
+     std::vector<webgpu_submission> subs;
+     uint32_t                       num_batched_kernels = 0;
+     bool                           contains_set_rows   = false;
+     for (int i = 0; i < cgraph->n_nodes; i++) {
++        // Logged before the node is encoded, not after. When a graph stops coming
++        // back the question is which node it is inside, and only a line printed
++        // beforehand answers that; one printed afterwards names the last node that
++        // finished and leaves the culprit to be inferred.
++        if (i % ggml_webgpu_trace_stride() == 0 || i == cgraph->n_nodes - 1) {
++            const ggml_tensor * node = cgraph->nodes[i];
++            WEBGPU_TRACE("encode node=%d/%d op=%s name=%s type=%s ne=[%lld,%lld,%lld,%lld]\n", i, cgraph->n_nodes,
++                         ggml_op_name(node->op), ggml_get_name(node), ggml_type_name(node->type),
++                         (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
++                         (long long) node->ne[3]);
++        }
+         if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS) {
+             contains_set_rows = true;
+         }
+@@ -2944,6 +3039,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+         }
+ 
+         if (num_batched_kernels >= WEBGPU_COMMAND_SUBMIT_BATCH_SIZE) {
++            WEBGPU_TRACE("submit #%zu after node=%d kernels=%u\n", subs.size(), i, num_batched_kernels);
+             num_batched_kernels = 0;
+             subs.push_back(ggml_backend_webgpu_submit(ctx->global_ctx, commands, ctx->param_buf_pool));
+             // Process events and check for completed submissions
+@@ -2953,6 +3049,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+         }
+     }
+     if (!commands.empty()) {
++        WEBGPU_TRACE("submit #%zu (last batch) commands=%zu\n", subs.size(), commands.size());
+         subs.push_back(ggml_backend_webgpu_submit(ctx->global_ctx, commands, ctx->param_buf_pool));
+         commands.clear();
+     }
+@@ -2974,6 +3071,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+     }
+ 
+     ggml_backend_webgpu_wait(ctx->global_ctx, subs);
++    WEBGPU_TRACE("graph_compute end\n");
+     WEBGPU_CPU_PROFILE_TOTAL_END(graph_compute, ctx->global_ctx);
+     return GGML_STATUS_SUCCESS;
+ }

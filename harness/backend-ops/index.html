@@ -1,0 +1,158 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>test-backend-ops harness</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; max-width: 1100px; }
+  h1 { font-size: 1.1rem; }
+  .note { color: #555; max-width: 74ch; }
+  .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin: .75rem 0; }
+  input[type=text] { font: inherit; padding: .2rem .35rem; }
+  button { font: inherit; padding: .25rem .8rem; }
+  pre { background: #f5f5f5; padding: .6rem; overflow: auto; max-height: 46vh; white-space: pre-wrap; }
+  #summary.pass { color: #0a0; }
+  #summary.bad { color: #c00; }
+  .ok { color: #0a0; font-weight: bold; }
+  .bad { color: #c00; font-weight: bold; }
+  .env span { margin-right: 1rem; }
+</style>
+
+<h1>test-backend-ops harness</h1>
+
+<p class="note">
+  Runs llama.cpp's own <code>tests/test-backend-ops</code> in this browser. It executes each op
+  on the backend under test and on the CPU backend in the same process and compares the
+  results, so a pass here is a numerical claim about the WebGPU kernels, not just evidence
+  that they were reachable.
+</p>
+
+<p class="note">
+  <strong>The verdict is computed here, not taken from the program.</strong> Its
+  <code>n/n tests passed</code> line and its exit status count only the cases it ran -
+  <code>NOT_SUPPORTED</code> and <code>SKIPPED</code> are skipped before the counter - so a run
+  that executed nothing still prints <code>0/0 tests passed</code> and exits 0. A pass here
+  needs the expected number of cases to have run on one WebGPU section and all of them to be
+  <code>OK</code>. Pass <code>--test-file</code> to supply that expected number; without it,
+  completeness cannot be claimed.
+</p>
+
+<div class="env" id="env"></div>
+
+<div class="row">
+  <label>args <input type="text" id="args" size="52" value="-o MUL_MAT_ID"></label>
+  <button id="run">run</button>
+  <span id="status"></span>
+</div>
+
+<h2>Verdict</h2>
+<pre id="summary">(not run)</pre>
+
+<h2>Output</h2>
+<pre id="out"></pre>
+
+<script type="module">
+import { BackendOpsSummary, countExpectedCases } from "./summary.mjs";
+
+const el = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+
+const checks = [
+  ["window.isSecureContext", window.isSecureContext === true],
+  ["crossOriginIsolated", window.crossOriginIsolated === true],
+  ["SharedArrayBuffer", typeof SharedArrayBuffer === "function"],
+  ["navigator.gpu", Boolean(navigator.gpu)],
+];
+el("env").innerHTML = checks
+  .map(([name, ok]) => `<span class="${ok ? "ok" : "bad"}">${ok ? "OK" : "NG"} ${name}</span>`)
+  .join("");
+
+if (params.get("args")) el("args").value = params.get("args");
+
+// Scrollback for a human. Bounded on purpose - and deliberately NOT what the verdict
+// reads, because a truncated log would quietly drop failures from the count.
+const shown = [];
+const show = (text) => {
+  shown.push(text);
+  if (shown.length > 4000) shown.splice(0, shown.length - 4000);
+  el("out").textContent = shown.join("\n");
+  el("out").scrollTop = el("out").scrollHeight;
+};
+
+const setVerdict = (summary) => {
+  summary.flush();
+  el("summary").textContent = summary.format();
+  el("summary").className = summary.verdict().pass ? "pass" : "bad";
+};
+
+/**
+ * Cases can come from a file produced by llama-export-graph-ops, which carries a real
+ * model's shapes, strides and op_params. The file is fetched and written into MEMFS in
+ * preRun so `--test-file <path>` finds it, and its line count is what the verdict
+ * compares against.
+ */
+async function loadTestFile(argv) {
+  const at = argv.indexOf("--test-file");
+  if (at < 0 || at + 1 >= argv.length) return undefined;
+  const target = argv[at + 1];
+  const name = target.replace(/^\/+/, "");
+  const response = await fetch(`./${name}`);
+  if (!response.ok) throw new Error(`could not fetch ${name}: HTTP ${response.status}`);
+  const text = await response.text();
+  const expected = countExpectedCases(text);
+  show(`test file: ${name} (${text.length} bytes, ${expected} case(s) expected)`);
+  return { target, bytes: new TextEncoder().encode(text), expected };
+}
+
+el("run").addEventListener("click", async () => {
+  el("run").disabled = true;
+  el("status").textContent = "running...";
+  shown.length = 0;
+  el("out").textContent = "";
+  el("summary").textContent = "(running)";
+  el("summary").className = "";
+
+  const argv = el("args").value.trim().split(/\s+/).filter(Boolean);
+  show(`argv: ${argv.join(" ")}`);
+
+  try {
+    const testFile = await loadTestFile(argv);
+    const summary = new BackendOpsSummary({ expected: testFile?.expected ?? null });
+    // Every line goes to the judge as it arrives; the scrollback is a separate concern.
+    const emit = (text) => {
+      summary.feed(text + "\n");
+      show(text);
+    };
+
+    const factory = (await import("./test-backend-ops.js")).default;
+    await factory({
+      arguments: argv,
+      print: emit,
+      printErr: emit,
+      preRun: testFile
+        ? [(mod) => {
+            const dir = testFile.target.slice(0, testFile.target.lastIndexOf("/"));
+            if (dir) mod.FS.mkdirTree(dir);
+            mod.FS.writeFile(testFile.target, testFile.bytes);
+          }]
+        : undefined,
+      onExit: (code) => {
+        el("status").innerHTML = code === 0
+          ? '<span class="ok">exit 0</span>'
+          : `<span class="bad">exit ${code}</span>`;
+        setVerdict(summary);
+        el("run").disabled = false;
+      },
+      onAbort: (what) => {
+        el("status").innerHTML = `<span class="bad">aborted: ${what}</span>`;
+        setVerdict(summary);
+        el("run").disabled = false;
+      },
+    });
+  } catch (error) {
+    show(`harness error: ${error?.message ?? error}`);
+    el("status").innerHTML = '<span class="bad">harness error</span>';
+    el("run").disabled = false;
+  }
+});
+
+if (params.get("auto") === "1") el("run").click();
+</script>

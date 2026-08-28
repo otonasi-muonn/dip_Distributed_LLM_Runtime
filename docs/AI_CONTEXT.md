@@ -15,6 +15,7 @@
 | [CONSTRAINTS.md](CONSTRAINTS.md) | 技術制約を「検証済み / 仮説 / 未解決」で分類。技術的事実の詳細 |
 | [EXPERIMENTS.md](EXPERIMENTS.md) | モデルサイズの梯子と過去の実験計画・失敗記録 |
 | [STAGE3_RESULT_2026-08-25.md](STAGE3_RESULT_2026-08-25.md) | **最新の物理2PC実験結果**。Stage 3 の現行ステータスはこちらを優先 |
+| [QWEN36_RESULT_2026-08-28.md](QWEN36_RESULT_2026-08-28.md) | **Qwen3.6 / MoE 対応の結果**。`MUL_MAT_ID` backport と残 blocker O11 |
 | [handoff/web-repo-corrections.md](handoff/web-repo-corrections.md) | Web アプリ側リポジトリへの指摘 |
 
 ## このリポジトリについて
@@ -159,9 +160,22 @@ peer を再起動すると戻ります。**原因は未切り分け** — 観測
 
 ### P1 — 本命モデル / memory pooling
 
-現状 WebGPU backend は `MUL_MAT_ID` を持たず MoE が動かないため、Qwen3.6-35B-A3B をそのまま本命デモに使えません。
+**2026-08-28 更新。**「WebGPU backend が `MUL_MAT_ID` を持たない」という制約は**解消しました** —
+upstream から backport し (`patches/0004`)、WebGPU 上で CPU 参照と 455/455 一致することまで
+確認済みです。Qwen3.6 の architecture / tokenizer / tensor 構造も pin がそのまま扱えます。
 
-まず dense model で「単一 peer では載らず、複数 peer なら載る」を証明する。
+**残っているのは別の問題**: 実 MoE モデルを WebGPU peer で走らせると first token に
+到達しません (O11)。**WebGPU 固有経路までは切り分け済みですが、hang / 極端な同期遅延 /
+特定 op・graph 構成のどれかは未確定**です。**測定は統合GPU 1 台のみ**なので、
+まず discrete GPU 機で再現するか確かめる必要があります。
+詳細: [QWEN36_RESULT_2026-08-28.md](QWEN36_RESULT_2026-08-28.md)
+
+⚠️ **モデル選定に制約があります。** backport した `MUL_MAT_ID` は **IQ 系量子化に非対応**なので、
+expert が IQ で量子化された GGUF (unsloth の UD 系など) は WebGPU peer で実行できません。
+また MTP 層を含む GGUF は `block_count` が 1 増えるため pin では load できません。
+`scripts/probe-gguf-header.mjs` がどちらもモデルごとに判定します。
+
+引き続き dense model で「単一 peer では載らず、複数 peer なら載る」を先に証明する。
 
 また WebGPU RPC device の `free memory` は実空きではなく `maxBufferSize` を返すため、自動配分は実メモリ比例ではありません。異種端末での OOM リスクは残ります。
 

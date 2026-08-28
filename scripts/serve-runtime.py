@@ -36,6 +36,8 @@ import sys
 # type breaks WebAssembly streaming instantiation.
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("text/javascript", ".js")
+# Browsers refuse an ES module served as text/plain, and Python does not know .mjs.
+mimetypes.add_type("text/javascript", ".mjs")
 mimetypes.add_type("application/octet-stream", ".gguf")
 
 MODEL_MOUNT = "/model.gguf"

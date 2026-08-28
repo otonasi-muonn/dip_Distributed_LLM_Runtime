@@ -478,10 +478,14 @@ function configureFiles(Module, baseUrl, moduleUrl) {
   Module.mainScriptUrlOrBlob = moduleUrl;
 }
 
-function configureNoColor(Module) {
+function configureEnv(Module, env) {
   Module.preRun ??= [];
   Module.preRun.push(() => {
     Module.ENV.NO_COLOR = "1";
+    for (const [key, value] of Object.entries(env ?? {})) {
+      if (value === undefined || value === null) continue;
+      Module.ENV[key] = String(value);
+    }
   });
 }
 
@@ -523,6 +527,10 @@ function safeForceExit(Module) {
  * The PeerManager must already be wired to the Web application's DataChannel layer.
  * Keep this Runtime alive across generation changes; only the PeerManager links should
  * be reorganized between generations.
+ *
+ * `options.env` sets environment variables the WASM side reads through getenv(). It
+ * exists so a diagnostic build can be switched on where a problem reproduces instead of
+ * being rebuilt there - GGML_WEBGPU_TRACE is the one that matters today.
  */
 export function startPeer(options) {
   requireBrowserRuntime();
@@ -558,7 +566,7 @@ export function startPeer(options) {
       };
       if (options.disableWebGPU) Module.arguments.push("-device", "cpu");
 
-      configureNoColor(Module);
+      configureEnv(Module, options.env);
       configureFiles(Module, baseUrl, moduleUrl);
 
       Module.onRuntimeInitialized = () => settleResolve(ready);
@@ -729,7 +737,7 @@ export function startRequester(options) {
         promptWaiter = cb;
       };
 
-      configureNoColor(Module);
+      configureEnv(Module, options.env);
       configureFiles(Module, baseUrl, moduleUrl);
       await prepareModel(Module, chunkCache, options.model);
 

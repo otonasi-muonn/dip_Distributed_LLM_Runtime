@@ -21,7 +21,9 @@ the WaitAny status are four different faults that currently look identical from 
 outside:
 
     graph_compute begin n_nodes=N
-    encode node=i/N op=...            every 64 nodes, and the last one
+    encode node=i/N op=...            before encoding node i, every
+                                      GGML_WEBGPU_TRACE_STRIDE nodes
+                                      (default 64), and the last one
     submit #k after node=i kernels=n
     wait(partial|final) begin subs=k
     WaitAny #n status=TimedOut|Error|Unknown
@@ -34,7 +36,7 @@ Deliberate choices:
     carried to the machine where the stall reproduces and switched on there, instead
     of being rebuilt there. The Runtime adapter passes it through Module.ENV, the
     same way it already sets NO_COLOR.
-  - Nodes are logged every 64, not every node: thousands of lines per graph would
+  - Nodes are logged every 64 by default, not every node: thousands of lines would
     make the logging itself a plausible reason the timing changed.
   - WaitAny retries are thinned to 1, 10, 50, then every 100 up to 1000, then every
     1000 - roughly immediately, 1 s, 5 s, every 10 s, then every 100 s at the 100 ms
@@ -42,11 +44,15 @@ Deliberate choices:
     spinning on TimedOut and spinning on Error are different faults and the thinning
     would otherwise hide the moment one becomes the other.
 
+GGML_WEBGPU_TRACE_STRIDE narrows that once a stall is known to sit inside one of
+those windows: set it to 1 and the last line names the node. Too noisy to leave on,
+and useless before there is a window to narrow, which is why it is not the default.
+
 This is not a Qwen3.6 compatibility patch and nothing depends on it. If O11 is
 resolved without it, drop it.
 
 diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-index 910e9c040..d3db7bb18 100644
+index d9580cb8e..160ea86d8 100644
 --- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
 +++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
 @@ -18,6 +18,7 @@
@@ -57,7 +63,7 @@ index 910e9c040..d3db7bb18 100644
  #include <cstring>
  #ifdef GGML_WEBGPU_GPU_PROFILE
  #    include <iomanip>
-@@ -499,6 +500,59 @@ static void ggml_backend_webgpu_wait_profile_futures(webgpu_global_context &
+@@ -499,6 +500,70 @@ static void ggml_backend_webgpu_wait_profile_futures(webgpu_global_context &
  #endif
  
  // Wait for the queue to finish processing all submitted work
@@ -84,7 +90,18 @@ index 910e9c040..d3db7bb18 100644
 +
 +// One line per node would be thousands of lines per graph, and the logging itself would
 +// then be a plausible reason the timing changed.
-+#define WEBGPU_TRACE_NODE_STRIDE 64
++// How many nodes between encode lines. 64 keeps a 1591-node graph to ~25 lines, which
++// is enough to say which phase a stall is in. Narrowing a stall to one node needs
++// GGML_WEBGPU_TRACE_STRIDE=1, which is far too noisy to be the default but is the whole
++// point once a graph is known to stop somewhere in a 64-node window.
++static int ggml_webgpu_trace_stride() {
++    static const int stride = [] {
++        const char * env = getenv("GGML_WEBGPU_TRACE_STRIDE");
++        const int    n   = env ? atoi(env) : 0;
++        return n > 0 ? n : 64;
++    }();
++    return stride;
++}
 +
 +static const char * ggml_webgpu_wait_status_name(wgpu::WaitStatus status) {
 +    switch (status) {
@@ -117,7 +134,7 @@ index 910e9c040..d3db7bb18 100644
  static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
                                       std::vector<webgpu_submission> & subs,
                                       bool                             block = true) {
-@@ -506,9 +560,26 @@ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
+@@ -506,9 +571,26 @@ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
          return;
      }
  
@@ -144,7 +161,7 @@ index 910e9c040..d3db7bb18 100644
          if (ggml_backend_webgpu_handle_wait_status(waitStatus, true)) {
  #ifdef GGML_WEBGPU_GPU_PROFILE
              ggml_backend_webgpu_wait_profile_futures(ctx, subs[0].profile_futures, true);
-@@ -518,6 +589,9 @@ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
+@@ -518,6 +600,9 @@ static void ggml_backend_webgpu_wait(webgpu_global_context &          ctx,
          blocking_wait = (block && !subs.empty()) || subs.size() >= WEBGPU_MAX_INFLIGHT_SUBS_PER_THREAD;
      }
  
@@ -154,7 +171,7 @@ index 910e9c040..d3db7bb18 100644
      if (subs.empty()) {
          return;
      }
-@@ -2770,6 +2844,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+@@ -2929,12 +3014,22 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
      webgpu_context                ctx         = backend_ctx->webgpu_ctx;
  
      WEBGPU_CPU_PROFILE_TOTAL_START(graph_compute);
@@ -162,21 +179,30 @@ index 910e9c040..d3db7bb18 100644
  
      std::vector<webgpu_command>    commands;
      std::vector<webgpu_submission> subs;
-@@ -2784,7 +2859,13 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
-             num_batched_kernels += cmd.value().num_kernels;
-         }
- 
-+        if (i % WEBGPU_TRACE_NODE_STRIDE == 0 || i == cgraph->n_nodes - 1) {
+     uint32_t                       num_batched_kernels = 0;
+     bool                           contains_set_rows   = false;
+     for (int i = 0; i < cgraph->n_nodes; i++) {
++        // Logged before the node is encoded, not after. When a graph stops coming
++        // back the question is which node it is inside, and only a line printed
++        // beforehand answers that; one printed afterwards names the last node that
++        // finished and leaves the culprit to be inferred.
++        if (i % ggml_webgpu_trace_stride() == 0 || i == cgraph->n_nodes - 1) {
 +            WEBGPU_TRACE("encode node=%d/%d op=%s\n", i, cgraph->n_nodes,
 +                         ggml_op_name(cgraph->nodes[i]->op));
 +        }
 +
+         if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS) {
+             contains_set_rows = true;
+         }
+@@ -2944,6 +3039,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+         }
+ 
          if (num_batched_kernels >= WEBGPU_COMMAND_SUBMIT_BATCH_SIZE) {
 +            WEBGPU_TRACE("submit #%zu after node=%d kernels=%u\n", subs.size(), i, num_batched_kernels);
              num_batched_kernels = 0;
              subs.push_back(ggml_backend_webgpu_submit(ctx->global_ctx, commands, ctx->param_buf_pool));
              // Process events and check for completed submissions
-@@ -2794,6 +2875,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+@@ -2953,6 +3049,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
          }
      }
      if (!commands.empty()) {
@@ -184,7 +210,7 @@ index 910e9c040..d3db7bb18 100644
          subs.push_back(ggml_backend_webgpu_submit(ctx->global_ctx, commands, ctx->param_buf_pool));
          commands.clear();
      }
-@@ -2815,6 +2897,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
+@@ -2974,6 +3071,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
      }
  
      ggml_backend_webgpu_wait(ctx->global_ctx, subs);

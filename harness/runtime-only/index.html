@@ -114,7 +114,14 @@ const autoMode = params.get("auto") === "1";
 // ?trace=1 turns on the WebGPU graph progress trace (patches/0005). It is an env
 // var rather than a build flag so the same bundle can be carried to a machine where
 // a stall reproduces and switched on there.
-const traceEnv = params.get("trace") === "1" ? { GGML_WEBGPU_TRACE: "1" } : undefined;
+const traceEnv = params.get("trace") === "1"
+  ? {
+      GGML_WEBGPU_TRACE: "1",
+      // ?stride=1 logs every node. Only worth it once a stall is known to sit
+      // inside one of the default 64-node windows and the node itself is wanted.
+      ...(params.get("stride") ? { GGML_WEBGPU_TRACE_STRIDE: params.get("stride") } : {}),
+    }
+  : undefined;
 const autoCycles = num("cycles", 1);
 
 el("role").value = role;

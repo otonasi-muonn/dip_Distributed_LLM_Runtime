@@ -181,3 +181,78 @@ pattern no longer anchored:
 
 Counting what should have run, and not only what printed, is what made a real
 failure visible.
+## C2 run 2 - trace ON with GGML_WEBGPU_TRACE_STRIDE=1
+
+Same fixed conditions. ready at 10.3 s, no first token, no runtime error.
+
+With every node logged, the trace stops here and stays there:
+
+  ...
+  webgpu-trace: encode node=148/1591 op=SET_ROWS
+  webgpu-trace: encode node=149/1591 op=VIEW
+  webgpu-trace: encode node=150/1591 op=PERMUTE
+  webgpu-trace: encode node=151/1591 op=VIEW
+  webgpu-trace: encode node=152/1591 op=PERMUTE
+  webgpu-trace: encode node=153/1591 op=VIEW
+  webgpu-trace: encode node=154/1591 op=PERMUTE
+  webgpu-trace: encode node=155/1591 op=MUL_MAT
+  webgpu-trace: encode node=156/1591 op=SOFT_MAX     <-- last line
+
+164 trace lines, unchanged over several minutes.
+
+⚠️ In the build that produced this, the line for node i is printed AFTER
+ggml_webgpu_encode_node() returns for node i. So node 156 finished, and the
+stall is inside encoding node 157 - whose op this build cannot name.
+
+It is not the submit: the submit trace prints before the submit call and no
+`submit #2` line ever appears. Nodes 105..156 simply never accumulated the 32
+kernels that trigger one.
+
+Nodes 149..156 (VIEW / PERMUTE / MUL_MAT / SOFT_MAX) are the shape of an
+attention block, so node 157 is plausibly the second MUL_MAT of attention - but
+that is inference from the surrounding ops, not something this trace showed.
+
+patches/0005 has since been changed to log before encoding rather than after,
+so the last line names the node that hangs instead of the last one that
+finished. The run above is from the earlier build.
+
+## C2 run 3 - trace ON, stride 1, logged BEFORE the encode call
+
+Rebuilt with patches/0005 logging each node before ggml_webgpu_encode_node()
+rather than after, so the last line names the node that hangs.
+
+ready at 9.7 s, no first token, no runtime error. Trace stopped at 165 lines and
+stayed there for over three minutes:
+
+  webgpu-trace: encode node=152/1591 op=PERMUTE
+  webgpu-trace: encode node=153/1591 op=VIEW
+  webgpu-trace: encode node=154/1591 op=PERMUTE
+  webgpu-trace: encode node=155/1591 op=MUL_MAT
+  webgpu-trace: encode node=156/1591 op=SOFT_MAX
+  webgpu-trace: encode node=157/1591 op=MUL_MAT      <-- last line
+
+  submits: 2      wait(final): never      WaitAny lines: 0
+
+O11 IS: ggml_webgpu_encode_node() does not return for node 157, a MUL_MAT, in
+the granite MoE graph on this device. Not the GPU wait, not the submit, not an
+unsupported op - encoding one node.
+
+That the previous build's last line was node 156 and this one's is 157 is
+exactly the one-line shift expected from moving the log ahead of the encode
+call, which is a small confirmation that both builds saw the same stall.
+
+### Why this is worth stating carefully
+
+MUL_MAT is not a suspect kernel. In Part D on this same device it passed 131 of
+131 executed cases at Qwen3.6's real shapes, including q2_K, q3_K, q4_K and q6_K
+sources up to [2048, 248320].
+
+So the same op that computes correctly on its own does not return when it is
+encoded at this point in a real graph. That points at the state the encode path
+is in - buffers, bindings, pipeline cache - rather than at the kernel, and it is
+precisely the ground Part D said it could not cover: "op を繋いだときの buffer
+alias / queue / 同期 / lifetime は未検証".
+
+⚠️ Still one machine. Whether node 157 hangs on a discrete GPU is the next
+question, and docs/L2_TARGET_PC_RUNBOOK.md is written to answer it.
+

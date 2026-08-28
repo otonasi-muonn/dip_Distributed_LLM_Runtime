@@ -25,7 +25,8 @@ $RuntimePatchTargets = @(
     @{ Name = "0001-llmlet-close-peer-free-connbuf.patch"; Repo = "." },
     @{ Name = "0002-ggml-rpc-close-accepted-fd.patch"; Repo = "llama.cpp" },
     @{ Name = "0003-ggml-webgpu-keep-reg-context-on-emscripten.patch"; Repo = "llama.cpp" },
-    @{ Name = "0004-ggml-webgpu-mul-mat-id.patch"; Repo = "llama.cpp" }
+    @{ Name = "0004-ggml-webgpu-mul-mat-id.patch"; Repo = "llama.cpp" },
+    @{ Name = "0005-ggml-webgpu-graph-progress-trace.patch"; Repo = "llama.cpp" }
 )
 
 function Write-RuntimeTextFile {

@@ -1,0 +1,183 @@
+# O11 baseline on AMD Radeon 780M (integrated), 2026-08-28
+
+## Environment
+GPU                : AMD Radeon 780M (integrated, RDNA-3), dedicated VRAM 0.5 GB
+System RAM         : 31.29 GB
+Chrome             : 148.0.7778.280
+WebGPU adapter     : vendor=amd architecture=rdna-3 (device/description empty)
+maxBufferSize                     : 2147483648
+maxStorageBufferBindingSize       : 2147483644
+maxComputeInvocationsPerWorkgroup : 1024
+maxComputeWorkgroupStorageSize    : 32768
+maxComputeWorkgroupsPerDimension  : 65535
+minStorageBufferOffsetAlignment   : 256
+
+## Runtime under test
+llmlet_commit=730bad2f5b4d6598f55b09eb22d54b5bf2a467ed
+llamacpp_commit=c4b18b39dbebb29d2f9f934dd0b136a9493a962e
+patch=0001-llmlet-close-peer-free-connbuf.patch sha256=BDBD647AB0BFD84D7B75A0E1A7D229A3028FE5FA47A81AEBB18FBE539E189E18
+patch=0002-ggml-rpc-close-accepted-fd.patch sha256=5D73F3BA0FB1682327835D5D17EACFF32CE41051486663118F7F2A60C6716549
+patch=0003-ggml-webgpu-keep-reg-context-on-emscripten.patch sha256=1B28E5D0FB5D4AC87514797CEB1783D6351CF3B6A22BB49C7489BFB4039CBE52
+patch=0004-ggml-webgpu-mul-mat-id.patch sha256=AEA090D7C9DA5F185DFD1A8C09B2C38951A65E8CA99BB0CB0D710A7E73128B92
+patch=0005-ggml-webgpu-graph-progress-trace.patch sha256=C7E8D3C0F8315F6FC1AC0C783F147F2306BA1192D097743D1A02BBA8E53352B5
+artifact=llmlet-mod.js sha256=710E3B95F82DE462F6EE43650BE3AFE719094F4835E38044F6300136C5C1856E
+artifact=llmlet-mod.wasm sha256=D87DFE6C4E12DED0FCA2F2ACB8DF3998C2B920AADB1801C39908854634752EA3
+
+## Model
+granite-3.0-1b-a400m-instruct-Q4_K_M.gguf
+sha256 074f09e13484e54e73c93830d34e9fa9917a6319fb8bae762a22594b9b4da0dc
+
+## Fixed conditions
+prompt      : What is the capital of France? Reply with only the city name.
+peers       : 1 WebGPU peer (same machine, second tab, BroadcastChannel transport)
+timeout     : 300 s
+graph nodes : 1592, graph splits 2
+
+## C1 run 1 - trace OFF
+
+ready reached      : yes, 35.4 s
+first token        : none (output stayed at the 18-byte "--- generate ---" header)
+runtime error      : none before the timeout
+outcome            : generation failed: generate() timed out after 300s  (at 300.9 s)
+peer               : alive throughout, RPC loop still printing "Handling requests", no error
+webgpu-trace lines : 0 (expected, trace off)
+
+## C1 run 2 - trace OFF
+
+ready reached      : yes, 8.7 s (model chunks already in IndexedDB)
+first token        : none
+runtime error      : none before the timeout
+outcome            : generation failed: generate() timed out after 300s
+webgpu-trace lines : 0
+
+C1 summary: 2/2 runs reached ready, produced no first token, raised no runtime
+error, and ended at the 300 s cutoff. That is the external symptom set the
+trace-on runs have to reproduce for the trace to be usable as a baseline.
+
+## C2 run 1 - trace ON (GGML_WEBGPU_TRACE=1 on the peer)
+
+ready reached      : yes, 26.3 s
+first token        : none
+runtime error      : none
+outcome            : 300 s cutoff
+  -> external symptoms identical to C1, so the trace did not change what is
+     being measured.
+
+Full trace emitted by the peer, complete (10 lines, unchanged for >4 minutes):
+
+  webgpu-trace: graph_compute begin n_nodes=1591
+  webgpu-trace: encode node=0/1591 op=SCALE
+  webgpu-trace: submit #0 after node=48 kernels=33
+  webgpu-trace: wait(partial) begin subs=1
+  webgpu-trace: wait(partial) end retries=0 subs=1
+  webgpu-trace: encode node=64/1591 op=ADD
+  webgpu-trace: submit #1 after node=104 kernels=32
+  webgpu-trace: wait(partial) begin subs=2
+  webgpu-trace: wait(partial) end retries=0 subs=2
+  webgpu-trace: encode node=128/1591 op=ADD          <-- last line, then nothing
+
+What this establishes:
+
+  - The stall is inside the encode loop, not in GPU completion. The last event
+    is an encode, and `wait(final)` is never reached.
+  - The GPU work that was submitted did complete: both wait(partial) calls
+    returned with retries=0.
+  - There are no WaitAny lines at all, so the "WaitAny retries forever on
+    TimedOut or Error" hypothesis is FALSIFIED for this stall.
+  - Encode lines are thinned to every 64 nodes and submits happen every 32
+    kernels, so the stall is somewhere in nodes 129..192 of 1591. `submit #2`
+    never appears.
+
+Confirmed stable: the trace was still exactly these 10 lines at 678 s after the
+generation started (well past the 300 s cutoff). The encode loop is not slow,
+it has stopped.
+
+## Part D - Qwen3.6 real-shape ops (test-backend-ops --test-file), 780M
+
+Op set exported from mradermacher/Qwen3.6-35B-A3B-GGUF:Q2_K metadata only, no
+weights fetched: prefill 73 unique ops, decode 63, 136 unique overall.
+
+VERDICT: NOT A PASS.
+
+  expected cases  : 136   (non-empty lines in qwen36-ops.txt)
+  observed cases  : 136
+    OK            : 131
+    FAIL          : 1
+    NOT SUPPORTED : 4
+    SKIPPED       : 0
+    UNKNOWN       : 0
+
+The program's own line read "131/132 tests passed", which counts only the cases
+it chose to run.
+
+### The one FAIL
+
+  GATED_DELTA_NET(name=__fgdn_ch__-0, type=f32, ne=[4096,640,1,1],
+    sources=f32[128,16,512,1], f32[128,16,512,1], f32[128,32,512,1],
+            f32[1,32,512,1], f32[1,32,512,1], f32[128,128,32,1]): FAIL
+  [GATED_DELTA_NET] inf mismatch: WebGPU=-inf  CPU=-2.914e37
+
+The chunked Gated DeltaNet at batch 512. The autoregressive form
+(__fgdn_ar__, batch 1) passed.
+
+⚠️ Do not read this as a confirmed kernel defect yet. test-backend-ops drives ops
+with random inputs, and the CPU reference here produced -2.9e37, itself within a
+factor of ~10 of the f32 maximum. Both sides are near overflow, so this may be an
+unstable op fed values a real model would never produce. What is established is
+that the two backends disagree at this shape; whether that matters for real
+activations is not.
+
+### The four NOT SUPPORTED
+
+  2x MUL_MAT_ID ffn_moe_gate_up-0, src0=F32[2048,1024,256] = 2,147,483,648 bytes
+      maxStorageBufferBindingSize here is 2,147,483,644 - over by exactly 4
+      bytes, so supports_op rejects it on size (F12). src0 is F32 only because
+      the fused gate_up tensor is built at load time rather than read from the
+      file, so under no_alloc it keeps the default type. The real weights are
+      Q2_K/Q3_K, roughly 8x smaller. This is an artifact of how the ops were
+      exported, not a property of the model.
+
+  2x FLASH_ATTN_EXT __fattn__-3
+      ggml-webgpu compiles flash attention out under Emscripten. The Runtime
+      also disables flash attention at run time (a fork commit in llmlet's
+      main.cpp, "disable flash_attn to make it compatible with the rpc
+      backend"), so these ops do not appear in the graph the peer actually
+      receives. The exporter builds with default params, which is why they are
+      in the file at all.
+
+### What did pass, at the model's real dimensions
+
+  MUL_MAT_ID ffn_moe_down-0  dst=F32[2048,8]
+    src0=Q3_K[512,2048,256]  src1=F32[512,8]  src2=I32[8]              OK
+  MUL_MAT_ID ffn_moe_down-0  dst=F32[2048,8,512]  (prefill)            OK
+
+256 experts, 8 used, real Q3_K expert weights - the coverage gap the review
+called out. Also passing at real shapes: GATED_DELTA_NET (autoregressive),
+SSM_CONV, ROPE, ARGSORT, SOFT_MAX, L2_NORM, SOFTPLUS, SWIGLU, SET_ROWS, and
+MUL_MAT against q2_K/q3_K/q4_K/q6_K up to [2048, 248320].
+
+### A slow case, not a stalled one
+
+  GET_ROWS(name=model.input_embed, dst=F32[2048,512],
+           src0=Q2_K[2048,248320], src1=I32[512]): OK
+
+This one took over 12 minutes while its neighbours took seconds; the same gather
+of a single row from the same table returned immediately. It did finish and it
+did match the CPU reference. Worth remembering as a slow path, not a fault.
+
+### What the verdict caught that nothing else would have
+
+Run through the pattern the judge used before this run, anchored to the two
+leading spaces of a case line:
+
+  observed 135, OK 131, FAIL 0, NOT SUPPORTED 4
+
+The FAIL is invisible there, because test-backend-ops prints the mismatch report
+inline ahead of the case, so that line does not start with two spaces. The only
+signal was that 135 did not equal the 136 cases in the input file. With the
+pattern no longer anchored:
+
+  observed 136, OK 131, FAIL 1, NOT SUPPORTED 4     (131 + 1 + 4 = 136)
+
+Counting what should have run, and not only what printed, is what made a real
+failure visible.

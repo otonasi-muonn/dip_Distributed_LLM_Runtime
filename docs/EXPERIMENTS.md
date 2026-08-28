@@ -946,3 +946,66 @@ target に混ぜていない。
 `
 ` / 末尾改行なし + `flush()`) を固定している。**判定器を UI callback の
 偶然の仕様に依存させない**ため。
+
+## 2026-08-28 O11 の停止位置を特定した (Part C) / Qwen3.6 実 op 検証 (Part D)
+
+### Part C — trace で O11 の停止位置が出た
+
+`patches/0005` (WebGPU graph progress trace) をビルドし、固定条件で 3 run:
+
+| run | trace | ready | first token | error | 結果 |
+|---|---|---|---|---|---|
+| C1-1 | OFF | 35.4 s | なし | なし | 300 s timeout |
+| C1-2 | OFF | 8.7 s | なし | なし | 300 s timeout |
+| C2-1 | **ON** | 26.3 s | なし | なし | 300 s timeout |
+
+外形症状は 3 run とも一致 ⇒ **trace は症状を変えていない** (F57)。
+
+C2-1 の peer が出した trace は **10 行で完全停止** (678 秒後も同一):
+
+```text
+graph_compute begin n_nodes=1591
+encode node=0/1591 op=SCALE
+submit #0 after node=48 kernels=33
+wait(partial) begin subs=1
+wait(partial) end retries=0 subs=1
+encode node=64/1591 op=ADD
+submit #1 after node=104 kernels=32
+wait(partial) begin subs=2
+wait(partial) end retries=0 subs=2
+encode node=128/1591 op=ADD        <-- 最終行
+```
+
+**分かったこと (F56)**: 停止は **encode ループ内**。`wait(final)` 未到達、
+`wait(partial)` は **retries=0** で復帰、**`WaitAny` 行ゼロ** ⇒
+**「`WaitAny` が `TimedOut`/`Error` で永久リトライする」という機構仮説は反証**。
+停止は node 129..192 のどこか。
+
+### Part D — Qwen3.6 の実 op を 12.93GB 無しで検証
+
+`export-graph-ops` がメタデータのみから **136 unique ops** (prefill 73 / decode 63) を出力。
+
+```text
+VERDICT: NOT A PASS
+  expected 136 / observed 136
+  OK 131 / FAIL 1 / NOT SUPPORTED 4 / SKIPPED 0 / UNKNOWN 0
+```
+
+- **256 experts の `MUL_MAT_ID` (`ffn_moe_down`, 実 Q3_K) は prefill・decode とも OK** (F58)
+- **FAIL 1**: chunked Gated DeltaNet が WebGPU=-inf / CPU=-2.9e37 (F59)。
+  ⚠️ 乱数入力で両側とも overflow 近傍なので**カーネル欠陥と断定しない**
+- **NOT SUPPORTED 4**: いずれも実モデルの性質ではない (F60) —
+  export 由来の F32 フォールバックが 4 バイト超過 ×2、Runtime が無効化している
+  FLASH_ATTN_EXT ×2
+
+⚠️ **この PASS 範囲は「export された各 op を個別に実行した結果が CPU 参照と一致する」まで。**
+op を繋いだときの buffer alias / queue / 同期 / lifetime は未検証で、
+**O11 はまさにその領域**。
+
+### 判定器がなければ見落としていた (F61)
+
+`test-backend-ops` は失敗ケースを診断文の後ろに同じ行で出す。行頭 2 スペースに
+anchor していた分類器はそれだけを取りこぼし、**OK 131 / FAIL 0 / observed 135** と読めた。
+**入力 136 件と合わないことだけが手がかり**で、anchor を外して observed 136 / FAIL 1。
+
+生の trace と全ケースの内訳: `docs/evidence/o11-780m-trace-2026-08-28.txt`
